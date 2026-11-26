@@ -19,6 +19,17 @@ The modules communicate through HTTP and the host's tenant context, not project 
 5. Grant service subject `elsa-workflows` tenant-wide `content.assign`, `content.transfer`, `content.publish`, and `shifts.manage` (`GET /api/shifts/overdue` requires it). These grants are tenant-scoped and must be provisioned for each tenant; do not add them to the client token as global permissions.
 6. Ensure replicas share the module catalog/package storage and configure the Elsa database with durable storage/backups. PostgreSQL is the provider wired by this initial module.
 
-Section settings control the assignment delay (default five minutes) and checkout grace (default fifteen minutes), which is when Elsa calls the handover and Shifts checks the shift out. Assignment delay begins when the manager accepts the submission. The handover returns unfinished review work to the queue. Elsa finds ended shifts through `GET /api/shifts/overdue`, which lists only shifts that are not checked out yet. A shift that is checked out (by `ShiftClock` or a person) before Elsa's next poll past the grace gets no automatic handover. Editing a live creative work retains its published snapshot and cancels a pending schedule pending Desk reapproval.
+Section settings control the assignment delay (default five minutes) and checkout grace (default fifteen minutes), after which Shifts checks the shift out. Assignment delay begins when the manager accepts the submission. Editing a live creative work retains its published snapshot and cancels a pending schedule pending Desk reapproval.
+
+## Shift handover
+
+For every shift that ended (checked out by a person or by `ShiftClock`), Elsa calls Content's handover, which returns the shift's unfinished review work to the queue.
+
+- **Where it reads.** `GET /api/shifts/shifts/ended?since={utc}&take=500` (`shifts.manage`), oldest end first.
+- **Cursor.** One per tenant, **in memory**: the newest `endedAt` seen. Each read goes back five minutes behind it, because a shift can be saved after one with a later end was read. Handled shifts are skipped by id.
+- **Failures.** Only a successful handover counts. After a failed one (any other status, `404` and `409` included), the cursor stays at that shift and the next poll retries it; the other shifts are still handed over.
+- **Restarts.** A new process looks back `Elsa:HandoverLookback` (default `1.00:00:00`, one day) and hands those shifts over again; the handover is idempotent. A shift that ended longer ago than that while Elsa was down, or whose handover was still failing at a restart, may not be retried. Write the value as `days.hours:minutes:seconds`: `24:00:00` means 24 days.
+- **Replicas** each keep their own cursor and may repeat a handover.
+- **Older Shifts.** When the ended list answers `404`, Elsa uses `GET /api/shifts/overdue` and calls the handover once the shift is past its end plus the checkout grace. That list holds only shifts not checked out yet, so a shift checked out before Elsa's next poll past the grace gets no handover there.
 
 The current coordinator reconciles persisted business deadlines on a configurable polling interval. The Elsa engine, persistence, tenant resolver, and secured Elsa API are hosted by this module. Authorable Elsa workflow definitions for these operations are a follow-up; keep business state transitions in Content/Shifts if that is added.

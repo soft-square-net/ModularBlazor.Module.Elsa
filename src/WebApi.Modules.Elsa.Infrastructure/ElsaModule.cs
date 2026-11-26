@@ -27,7 +27,8 @@ public sealed class ElsaModule : IRuntimeModule, IModulePipeline
         {
             ["Elsa:Schema"] = "elsa",
             ["Elsa:RunMigrations"] = "true",
-            ["Elsa:PollInterval"] = "00:00:15"
+            ["Elsa:PollInterval"] = "00:00:15",
+            ["Elsa:HandoverLookback"] = "1.00:00:00" // days.hours: "24:00:00" would mean 24 days
         },
         Permissions =
         [

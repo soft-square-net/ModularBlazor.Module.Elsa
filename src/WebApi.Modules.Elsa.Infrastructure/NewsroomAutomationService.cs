@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using Elsa.Common.Multitenancy;
@@ -11,7 +12,8 @@ namespace soft.square.net.WebApi.Modules.Elsa.Infrastructure;
 
 /// <summary>
 /// Reconciles durable newsroom deadlines. Business state and deadlines remain in Content and Shifts; this process
-/// only issues idempotent commands through their APIs, so it can restart or run beside them in a single pool.
+/// only issues idempotent commands through their APIs, so it can restart or run beside them in a single pool. Its only
+/// state, the place in Shifts' ended list (<see cref="EndedShiftCursor"/>), is rebuilt from a lookback after a restart.
 /// </summary>
 internal sealed class NewsroomAutomationService(
     NewsroomAutomationClient client,
@@ -47,6 +49,7 @@ internal sealed class NewsroomAutomationService(
 internal sealed class NewsroomAutomationClient(HttpClient http, IConfiguration settings)
 {
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
+    private readonly Dictionary<string, EndedShiftCursor> _cursors = new(StringComparer.Ordinal); // per tenant
     private string? _accessToken;
     private DateTimeOffset _tokenExpiresAt;
 
@@ -80,6 +83,53 @@ internal sealed class NewsroomAutomationClient(HttpClient http, IConfiguration s
         // A schedule is stored by Content. Its own endpoint rechecks due times and performs a version-safe transition.
         await SendAsync(HttpMethod.Post, $"{api}/api/content/posts/publish-due", tenantId, token, cancellationToken);
 
+        await HandOverEndedShiftsAsync(api, tenantId, token, cancellationToken);
+    }
+
+    /// <summary>
+    /// Returns Content's unfinished reviews for every shift that ended. Shifts ends shifts itself (a check-out, or its
+    /// ShiftClock service); an older Shifts without the ended list is served by its overdue list.
+    /// </summary>
+    private async Task HandOverEndedShiftsAsync(string api, string tenantId, string token, CancellationToken cancellationToken)
+    {
+        if (!_cursors.TryGetValue(tenantId, out var cursor))
+            _cursors[tenantId] = cursor = new EndedShiftCursor(DateTimeOffset.UtcNow - HandoverLookback());
+
+        var listed = await cursor.DrainAsync(
+            (since, ct) => ReadEndedShiftsAsync(api, since, tenantId, token, ct),
+            async (shiftId, ct) =>
+            {
+                // Unlike SendAsync, only success counts: the cursor moves past a shift once Content has taken it.
+                using var request = CreateRequest(HttpMethod.Post, HandoverUrl(api, shiftId), tenantId, token);
+                using var response = await http.SendAsync(request, ct);
+                response.EnsureSuccessStatusCode();
+            },
+            cancellationToken);
+
+        if (!listed) await HandOverOverdueShiftsAsync(api, tenantId, token, cancellationToken);
+    }
+
+    private async Task<IReadOnlyList<EndedShift>?> ReadEndedShiftsAsync(
+        string api, DateTimeOffset since, string tenantId, string token, CancellationToken cancellationToken)
+    {
+        var from = Uri.EscapeDataString(since.UtcDateTime.ToString("O", CultureInfo.InvariantCulture));
+        using var request = CreateRequest(HttpMethod.Get,
+            $"{api}/api/shifts/shifts/ended?since={from}&take={EndedShiftCursor.PageSize}", tenantId, token);
+        using var response = await http.SendAsync(request, cancellationToken);
+        if (response.StatusCode == HttpStatusCode.NotFound) return null;
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
+        return document.RootElement.EnumerateArray()
+            .Select(s => new EndedShift(s.GetProperty("id").GetInt32(), s.GetProperty("endedAt").GetDateTimeOffset()))
+            .ToArray();
+    }
+
+    /// <summary>
+    /// For a Shifts without the ended list: hands over the shifts past their end plus the grace that are still listed as
+    /// overdue. A shift checked out before a poll sees it gets no handover here.
+    /// </summary>
+    private async Task HandOverOverdueShiftsAsync(string api, string tenantId, string token, CancellationToken cancellationToken)
+    {
         var overdue = await GetJsonAsync($"{api}/api/shifts/overdue", tenantId, token, cancellationToken);
         foreach (var shift in overdue.EnumerateArray())
         {
@@ -90,10 +140,17 @@ internal sealed class NewsroomAutomationClient(HttpClient http, IConfiguration s
                 !automation.TryGetProperty("checkoutGrace", out var graceValue) || !TryGetTimeSpan(graceValue, out var grace) ||
                 DateTimeOffset.UtcNow < endsAt + grace) continue;
 
-            // Handover is idempotent, so repeating it while the shift is still listed is safe. Shifts checks the shift
-            // out itself (its ShiftClock service); this coordinator only returns Content's unfinished reviews.
-            await SendAsync(HttpMethod.Post, $"{api}/api/content/automation/shifts/{shiftId}/handover", tenantId, token, cancellationToken);
+            await SendAsync(HttpMethod.Post, HandoverUrl(api, shiftId), tenantId, token, cancellationToken);
         }
+    }
+
+    private static string HandoverUrl(string api, int shiftId) => $"{api}/api/content/automation/shifts/{shiftId}/handover";
+
+    private TimeSpan HandoverLookback()
+    {
+        var fallback = TimeSpan.FromDays(1);
+        var lookback = settings.GetValue("Elsa:HandoverLookback", fallback);
+        return lookback > TimeSpan.Zero ? lookback : fallback;
     }
 
     /// <summary>
