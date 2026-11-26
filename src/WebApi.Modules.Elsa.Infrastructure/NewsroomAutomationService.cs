@@ -90,9 +90,9 @@ internal sealed class NewsroomAutomationClient(HttpClient http, IConfiguration s
                 !automation.TryGetProperty("checkoutGrace", out var graceValue) || !TryGetTimeSpan(graceValue, out var grace) ||
                 DateTimeOffset.UtcNow < endsAt + grace) continue;
 
-            // Transfer first; handover is idempotent, and a retry can safely complete checkout after a process restart.
+            // Handover is idempotent, so repeating it while the shift is still listed is safe. Shifts checks the shift
+            // out itself (its ShiftClock service); this coordinator only returns Content's unfinished reviews.
             await SendAsync(HttpMethod.Post, $"{api}/api/content/automation/shifts/{shiftId}/handover", tenantId, token, cancellationToken);
-            await SendAsync(HttpMethod.Post, $"{api}/api/shifts/shifts/{shiftId}/check-out", tenantId, token, cancellationToken);
         }
     }
 
