@@ -1,0 +1,34 @@
+<Project>
+  <!-- The module's settings (naming, target framework), plus what every test project shares. -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <OutputType>Exe</OutputType>
+    <!-- Keep in step with global.json (the Module SDK version) and its Platform.props. -->
+    <ModularBlazorPlatformVersion Condition="'$(ModularBlazorPlatformVersion)' == ''">1.0.0-preview.7</ModularBlazorPlatformVersion>
+  </PropertyGroup>
+
+  <!-- The test stack of the other modules: xUnit v3 and Shouldly. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.12.0" />
+    <PackageReference Include="xunit.v3.mtp-off" Version="4.0.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1" PrivateAssets="all"
+                      IncludeAssets="runtime; build; native; contentfiles; analyzers; buildtransitive" />
+    <PackageReference Include="Shouldly" Version="4.3.0" />
+  </ItemGroup>
+
+  <!--
+    The host-shared assemblies. The module compiles against them but never ships them (the host provides them at run
+    time), so a test process, which has no host, needs them itself.
+  -->
+  <ItemGroup>
+    <PackageReference Include="soft.square.net.WebApi.Contracts" Version="$(ModularBlazorPlatformVersion)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Shouldly" />
+    <Using Include="Xunit" />
+  </ItemGroup>
+</Project>

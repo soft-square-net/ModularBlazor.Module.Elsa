@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The handover: the ended-shifts cursor, and the coordinator's calls against a fake HTTP handler. No host. -->
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="..\..\src\WebApi.Modules.Elsa.Infrastructure\WebApi.Modules.Elsa.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>
