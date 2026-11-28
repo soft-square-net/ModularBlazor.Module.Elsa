@@ -51,9 +51,18 @@ public abstract class NewsroomActivity : Activity
 
     private const string ApprovalProperty = "approval";
 
+    // Elsa 3.9.0's name for the input that marks an activity reached through a loop's backward connection.
+    private const string BackwardInput = "BackwardConnection";
+    private const string BackwardProperty = "newsroom.reachedBackward";
+
     protected abstract Task<WaitStep> StepAsync(ActivityExecutionContext context, CancellationToken ct);
 
-    protected override ValueTask ExecuteAsync(ActivityExecutionContext context) => AdvanceAsync(context);
+    protected override ValueTask ExecuteAsync(ActivityExecutionContext context)
+    {
+        if (context.ActivityInput.TryGetValue(BackwardInput, out var backward) && backward is true)
+            context.SetProperty(BackwardProperty, true);
+        return AdvanceAsync(context);
+    }
 
     private ValueTask OnSignalAsync(ActivityExecutionContext context) => AdvanceAsync(context);
 
@@ -79,6 +88,9 @@ public abstract class NewsroomActivity : Activity
         if (step.Outcome is { } outcome)
         {
             context.ClearBookmarks();
+            // The flowchart counts visits by that mark, but Elsa forgets an activity's input once it has waited. Without
+            // it the counts drift, and a later loop silently ends the workflow instead of reaching its next activity.
+            if (context.GetProperty<bool>(BackwardProperty)) context.ActivityInput[BackwardInput] = true;
             await context.CompleteActivityWithOutcomesAsync(outcome);
             return;
         }

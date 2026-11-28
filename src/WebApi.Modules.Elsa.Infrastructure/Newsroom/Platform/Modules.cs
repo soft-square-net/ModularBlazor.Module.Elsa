@@ -7,7 +7,20 @@ namespace soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Platform;
 
 public sealed record PostSnapshot(
     int Id, int Version, string State, IReadOnlyList<string> Categories, Guid? UnitId, DateTimeOffset? ScheduledFor,
-    string? OwnerId = null, IReadOnlyList<PostContentSnapshot>? Contents = null, string? PostKind = null);
+    string? OwnerId = null, IReadOnlyList<PostContentSnapshot>? Contents = null, string? PostKind = null,
+    IReadOnlyList<PostHistoryEntry>? History = null)
+{
+    /// <summary>
+    /// Whether the post's schedule was taken back since a reviewer last approved it. Content shows such a post as plain
+    /// "Approved", but publishing it is the desk's to decide again: a workflow must neither publish nor schedule it.
+    /// Read from the post's history (oldest first), so that it also holds for what happened while nothing was looking.
+    /// </summary>
+    public bool ScheduleTakenBack =>
+        History?.LastOrDefault(e => e.Action is "approved" or "unscheduled")?.Action == "unscheduled";
+}
+
+/// <summary>One entry of a post's history.</summary>
+public sealed record PostHistoryEntry(string Action);
 
 /// <summary>A content attached to a post. <paramref name="FieldKey"/> is its content kind.</summary>
 public sealed record PostContentSnapshot(Guid ContentId, bool Required, string FieldKey, string Stage, bool Archived);

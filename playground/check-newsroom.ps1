@@ -11,6 +11,7 @@
 
     - no binding: no workflow, a setup error, and a dry run that says why; the binding's event then starts it;
     - newsroom-post and its newsroom-content sub-workflow, from filing to publication, with one return by the desk;
+      the reviewer's approval publishes nothing, nor does a schedule taken back: the desk publishes by hand;
     - a dry run that returns the steps and changes nothing;
     - the workflow assigns the reviewer, and again after Content returns the review of a reviewer who left the shift;
     - a killed project: the workflow and its sub-workflow are cancelled;
@@ -230,7 +231,7 @@ Check (-not (Api GET "content/contents/$($item.id)").Json.assigneeId) 'with nobo
 Step 'A dry run of the bound workflow changes nothing'
 $r = Invoke-DryRun $project
 $steps = @($r.Json.workflow.steps.activityId)
-Check ($r.Status -eq 200 -and ($steps -join ',') -eq 'ensure,produce,desk,publish,announce') "the steps are $($steps -join ', ') ($($r.Status)$(if ($r.Status -ne 200) { ": $($r.Text)" }))"
+Check ($r.Status -eq 200 -and ($steps -join ',') -eq 'ensure,produce,desk,publication,announce') "the steps are $($steps -join ', ') ($($r.Status)$(if ($r.Status -ne 200) { ": $($r.Text)" }))"
 $sub = @($r.Json.workflow.steps | Where-Object activityId -eq 'produce').steps
 Check (@($sub.steps.activityId) -join ',' -eq 'file,work') "and the content's: $(@($sub.steps.activityId) -join ', ')"
 Check (@(Get-Instances $project).Count -eq 2 -and -not (Api GET "content/contents/$($item.id)").Json.assigneeId) 'no instance and no assignment came of it'
@@ -269,14 +270,23 @@ $next = New-Shift
 Enter-Shift $next $reviewerSub
 Expect { (Get-PostState) -eq 'InReview' } 'the workflow assigned the review again' 120
 
-Step 'The desk returns the post once, then approves it; the workflow publishes it'
+Step 'The reviewer''s side returns the post once, then approves it; the desk publishes it and the workflow follows'
 Move-Post 'return' @{ note = 'Once more.' }
 Expect { (Get-Project $project).state -eq 'InProduction' } 'the returned post is in production again' 45
 Move-Post 'submit'
 Expect { (Get-Project $project).state -eq 'ReadyForDesk' } 'and back at the desk once submitted' 45
 Expect { (Get-PostState) -eq 'InReview' } 'with a reviewer again' 90
 Move-Post 'approve' -by (Get-ReviewerToken)
-Expect { (Get-PostState) -eq 'Published' } 'elsa-workflows published the post' 45
+Start-Sleep -Seconds 10
+Check ((Get-PostState) -eq 'Approved' -and (Get-Project $project).state -eq 'ReadyForDesk') 'the approval publishes nothing'
+Move-Post 'schedule' @{ publishAt = [DateTimeOffset]::UtcNow.AddHours(1).ToString('o') }
+Expect { (Get-Project $project).state -eq 'Scheduled' } 'the desk''s schedule is followed' 45
+Move-Post 'unschedule'
+Expect { (Get-Project $project).state -eq 'ReadyForDesk' } 'unscheduled, the project is back at the desk' 45
+Start-Sleep -Seconds 10
+Check ((Get-PostState) -eq 'Approved') 'and the post stays unpublished'
+Move-Post 'publish'
+Expect { (Get-PostState) -eq 'Published' } 'the desk published the post' 45
 Expect { @(Get-Instances $project | Where-Object status -ne 'Finished').Count -eq 0 } 'both workflows finished' 45
 $finished = Get-Instances $project
 Check (@($finished | Where-Object { $_.subStatus -ne 'Finished' -or $_.incidentCount -ne 0 }).Count -eq 0) 'with no incidents'
