@@ -25,6 +25,7 @@
   -->
   <ItemGroup>
     <PackageReference Include="soft.square.net.WebApi.Contracts" Version="$(ModularBlazorPlatformVersion)" />
+    <PackageReference Include="soft.square.net.WebApi.Data" Version="$(ModularBlazorPlatformVersion)" />
   </ItemGroup>
 
   <ItemGroup>

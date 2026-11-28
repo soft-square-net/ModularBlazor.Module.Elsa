@@ -1,4 +1,5 @@
 <Solution>
   <Project Path="src/WebApi.Modules.Elsa.Infrastructure/WebApi.Modules.Elsa.Infrastructure.csproj" />
+  <Project Path="tests/WebApi.Modules.Elsa.IntegrationTests/WebApi.Modules.Elsa.IntegrationTests.csproj" />
   <Project Path="tests/WebApi.Modules.Elsa.UnitTests/WebApi.Modules.Elsa.UnitTests.csproj" />
 </Solution>

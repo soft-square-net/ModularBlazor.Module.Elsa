@@ -7,8 +7,15 @@ using Elsa.Extensions;
 using Elsa.Persistence.EFCore;
 using Elsa.Persistence.EFCore.Extensions;
 using Elsa.Persistence.EFCore.Modules.Management;
+using Elsa.Features.Services;
 using Elsa.Persistence.EFCore.Modules.Runtime;
+using Elsa.Scheduling;
+using Elsa.Scheduling.Services;
 using Elsa.Tenants.Extensions;
+using Elsa.Workflows.Runtime.Distributed.Extensions;
+using Medallion.Threading.Postgres;
+using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom;
+using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Runtime;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Hosting;
@@ -40,23 +47,47 @@ internal sealed class ElsaEngine : IAsyncDisposable
     private readonly TaskCompletionSource _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly SemaphoreSlim _refresh = new(1, 1);
 
-    public ElsaEngine(IServiceProvider host, IConfiguration settings)
+    /// <param name="configureElsa">Adds to Elsa's setup; for tests.</param>
+    /// <param name="configureServices">Replaces services of the engine's container; for tests.</param>
+    public ElsaEngine(IServiceProvider host, IConfiguration settings,
+        Action<IModule>? configureElsa = null, Action<IServiceCollection>? configureServices = null)
     {
         using var context = InModuleLoadContext();
         var services = new ServiceCollection();
         BorrowHostServices(services, host);
         services.AddSingleton(settings); // allowlisted module configuration only; never the host configuration root
-        AddElsa(services, settings);
+        AddElsa(services, settings, configureElsa);
+        services.AddNewsroom(host);
+        configureServices?.Invoke(services);
         _services = services.BuildServiceProvider();
         _pipeline = BuildPipeline(_services);
     }
 
     /// <summary>
-    /// The engine's own container. Work outside a request needs a scope of it with the tenant pushed
-    /// (<see cref="ITenantAccessor.PushContext"/>), inside the module's load context: without a tenant, Elsa silently
-    /// uses an empty tenant id, and no tenant sees what it stored.
+    /// The engine's own container. Work outside a request goes through <see cref="RunInTenantAsync{T}"/>.
     /// </summary>
     internal IServiceProvider Services => _services;
+
+    /// <summary>
+    /// The only way to use Elsa outside a request: a scope of the engine's container, as one tenant, inside the module's
+    /// load context. Without a tenant Elsa silently uses an empty tenant id, and no tenant sees what it stored, so an
+    /// empty, unknown or inactive tenant is refused. Waits until the engine has started.
+    /// </summary>
+    public async Task<T> RunInTenantAsync<T>(string? tenantId,
+        Func<IServiceProvider, CancellationToken, Task<T>> work, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(tenantId))
+            throw new InvalidOperationException("Elsa runs for a tenant only: no tenant was given.");
+        if (_services.GetRequiredService<ITenantDirectory>().Find(tenantId) is not { IsActive: true } tenant)
+            throw new InvalidOperationException($"Elsa runs for active tenants only: '{tenantId}' is unknown or inactive.");
+        await _started.Task.WaitAsync(cancellationToken);
+
+        using var loadContext = InModuleLoadContext();
+        await using var scope = _services.CreateAsyncScope();
+        using var asTenant = _services.GetRequiredService<ITenantAccessor>()
+            .PushContext(new Tenant { Id = tenant.Id, Name = tenant.Name });
+        return await work(scope.ServiceProvider, cancellationToken);
+    }
 
     /// <summary>
     /// EF Core, a host assembly, loads Elsa's migrations by assembly name, which the host's load context cannot resolve:
@@ -85,7 +116,7 @@ internal sealed class ElsaEngine : IAsyncDisposable
         }
     }
 
-    private static void AddElsa(IServiceCollection services, IConfiguration settings)
+    private static void AddElsa(IServiceCollection services, IConfiguration settings, Action<IModule>? configure)
     {
         var connection = settings.GetConnectionString("elsa")
             ?? throw new InvalidOperationException("The host must provide ConnectionStrings:elsa from a secret provider.");
@@ -103,15 +134,28 @@ internal sealed class ElsaEngine : IAsyncDisposable
                 ef.RunMigrations = runMigrations;
                 ef.UsePostgreSql(connection, databaseOptions);
             }));
-            elsa.UseWorkflowRuntime(runtime => runtime.UseEntityFrameworkCore(ef =>
+            elsa.UseWorkflowRuntime(runtime =>
             {
-                ef.RunMigrations = runMigrations;
-                ef.UsePostgreSql(connection, databaseOptions);
-            }));
+                runtime.UseEntityFrameworkCore(ef =>
+                {
+                    ef.RunMigrations = runMigrations;
+                    ef.UsePostgreSql(connection, databaseOptions);
+                });
+                // Several replicas share the database: an instance runs in one of them at a time. The default lock
+                // provider locks files, which reaches one machine only.
+                runtime.UseDistributedRuntime();
+                runtime.DistributedLockProvider = _ => new PostgresDistributedSynchronizationProvider(connection);
+            });
+            elsa.UseScheduling(); // delays and deadlines
             elsa.UseTenants();
             elsa.UseWorkflowsApi();
             elsa.UseHttp();
+            elsa.AddActivitiesFrom<ElsaEngine>();
+            configure?.Invoke(elsa);
         });
+        services.AddSingleton<LocalScheduler>();
+        services.AddSingleton<StoppableScheduler>();
+        services.AddSingleton<IScheduler>(provider => provider.GetRequiredService<StoppableScheduler>());
         // Elsa's background work runs once per tenant of the platform's single tenant directory.
         services.AddSingleton<ITenantsProvider, ElsaPlatformTenantsProvider>();
     }
@@ -156,6 +200,7 @@ internal sealed class ElsaEngine : IAsyncDisposable
         for (var i = _running.Count - 1; i >= 0; i--)
             await _running[i].StopAsync(cancellationToken);
         _running.Clear();
+        await _services.GetRequiredService<StoppableScheduler>().StopAllAsync();
     }
 
     /// <summary>

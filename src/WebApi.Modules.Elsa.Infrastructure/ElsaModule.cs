@@ -2,7 +2,12 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using soft.square.net.WebApi.Contracts;
+using soft.square.net.WebApi.Contracts.Messaging;
 using soft.square.net.WebApi.Contracts.Tenancy;
+using soft.square.net.WebApi.Data;
+using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Data;
+using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Events;
+using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Runtime;
 
 namespace soft.square.net.WebApi.Modules.Elsa.Infrastructure;
 
@@ -13,12 +18,18 @@ public sealed class ElsaModule : IRuntimeModule, IModulePipeline
     {
         Description = "Optional Elsa workflow engine for newsroom automation.",
         HotUnload = false,
+        Subscriptions = [.. NewsroomEventTypes.Subscriptions],
         DefaultSettings = new Dictionary<string, string?>
         {
             ["Elsa:Schema"] = "elsa",
             ["Elsa:RunMigrations"] = "true",
             ["Elsa:PollInterval"] = "00:00:15",
-            ["Elsa:HandoverLookback"] = "1.00:00:00" // days.hours: "24:00:00" would mean 24 days
+            ["Elsa:HandoverLookback"] = "1.00:00:00", // days.hours: "24:00:00" would mean 24 days
+            ["Elsa:Newsroom:RecheckInterval"] = "00:05:00", // a waiting activity looks again at least this often
+            ["Elsa:Newsroom:SettleDelay"] = "00:00:02",
+            ["Elsa:Newsroom:RetryDelay"] = "00:00:30",
+            ["Elsa:Newsroom:TimerSweepInterval"] = "00:01:00",
+            ["Elsa:Newsroom:TimerSweepGrace"] = "00:00:30"
         },
         Permissions =
         [
@@ -35,6 +46,15 @@ public sealed class ElsaModule : IRuntimeModule, IModulePipeline
         services.AddSingleton(provider => new ElsaEngine(provider, settings));
         services.AddSingleton<ITenantInitializer, ElsaTenantInitializer>();
         services.AddHostedService<ElsaEngineService>(); // first: the coordinator starts after the engine
+        services.AddHostedService<TimerSweeperService>();
+
+        // The events that start and resume workflows, with their inbox in each tenant's database.
+        services.AddTenantDbContext<WorkflowEventsDbContext>();
+        // After AddTenantDbContext: tenant initializers run in registration order, so the schema is migrated first.
+        services.AddIntegrationEvents<WorkflowEventsDbContext>(options => options.Source = "elsa");
+        foreach (var pattern in NewsroomEventTypes.Subscriptions)
+            services.AddIntegrationHandler<NewsroomEventHandler>(pattern);
+
         services.AddHttpClient<NewsroomAutomationClient>();
         services.AddHostedService<NewsroomAutomationService>();
     }
