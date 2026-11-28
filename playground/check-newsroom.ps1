@@ -138,8 +138,11 @@ Check ($proposal.state -eq 'Submitted') "proposal $($proposal.id) is $($proposal
 
 Step 'A running shift with a writer and a reviewer, not yet checked in'
 # Shifts reads the unit's members as the caller, which takes org.read on the unit and the units above it.
-$held = @((Api GET "identity/grants?userId=$adminSub").Json) | Where-Object { $_.permission -eq 'org.read' -and $_.scope -eq 'tenant' }
-if (-not $held) { Api POST 'identity/grants' @{ userId = $adminSub; permission = 'org.read'; scope = 'tenant' } | Out-Null }
+# Content's approval has DynamicFields check the post as the caller, so the reviewer needs to read DynamicFields.
+foreach ($need in @(@{ user = $adminSub; permission = 'org.read' }, @{ user = $reviewerSub; permission = 'dynamicfields.read' })) {
+    $held = @((Api GET "identity/grants?userId=$($need.user)").Json) | Where-Object { $_.permission -eq $need.permission -and $_.scope -eq 'tenant' }
+    if (-not $held) { Api POST 'identity/grants' @{ userId = $need.user; permission = $need.permission; scope = 'tenant' } | Out-Null }
+}
 # An earlier run's shift may still have the writer checked in: the assignment must start with nobody there.
 $from = [Uri]::EscapeDataString([DateTimeOffset]::UtcNow.AddDays(-2).ToString('o'))
 $to = [Uri]::EscapeDataString([DateTimeOffset]::UtcNow.AddDays(1).ToString('o'))
@@ -315,15 +318,16 @@ function New-ScheduledProject([int] $inSeconds) {
     Check ((Get-PostState) -eq 'Scheduled') "post $($project.postId) is scheduled in $inSeconds s"
     return $script:project
 }
-$script:project = New-ScheduledProject 20
-Expect { (Get-PostState) -eq 'Published' } 'Content published the due post by itself' 120
-
 $script:project = New-ScheduledProject 3600
 $r = Api POST "newsroom/projects/$($project.id)/kill" @{ version = (Get-Project $project).version; reason = 'Elsa check' } -AllowFailure
 Check ($r.Status -lt 300) "killed the scheduled project ($($r.Status)$(if ($r.Status -ge 300) { ": $($r.Text)" }))"
 Expect { $p = (Api GET "content/posts/$($project.postId)").Json; $p.state -eq 'Approved' -and -not $p.scheduledFor } 'elsa-workflows unscheduled its post' 45
 Check ((Get-Project $project).state -eq 'Killed') 'the project stays killed'
 Check (@(Get-Instances $project).Count -eq 0) 'and no workflow ran for it'
+# Last: it waits for Content's clock.
+$script:project = New-ScheduledProject 20
+Expect { (Get-PostState) -eq 'Published' } 'Content published the due post by itself' 120
+
 Api POST "shifts/shifts/$($desk.id)/check-out" | Out-Null
 
 Write-Host ''
