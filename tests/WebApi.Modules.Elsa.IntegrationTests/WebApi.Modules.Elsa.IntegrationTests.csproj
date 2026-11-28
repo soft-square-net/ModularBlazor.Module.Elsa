@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The engine as the module builds it, on PostgreSQL in a container (so these need Docker), with the platform's APIs
+    faked: events, bookmarks, timers, two replicas and tenants. No host, no broker.
+  -->
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="..\..\src\WebApi.Modules.Elsa.Infrastructure\WebApi.Modules.Elsa.Infrastructure.csproj" />
+    <PackageReference Include="Testcontainers.PostgreSql" Version="4.17.0" />
+  </ItemGroup>
+
+</Project>

@@ -80,20 +80,28 @@ var core = AddPool("core", CorePort)
     .WithEnvironment("Modules__Excluded__0", "elsa");
 
 // The modules the workflows work with, each loaded from a built checkout (Debug build) next to this repo.
-var siblings = new (string Name, string Id, string[] ClientParts)[]
+// NewsRoom is optional until its projects are merged: without it the playground runs, and the newsroom workflows that
+// need a project wait.
+var siblings = new (string Name, string Id, bool Optional, string[] ClientParts)[]
 {
-    ("Organization", "organization", ["WebApi.Modules.Organization.Client", "Module.Organization"]),
-    ("Shifts", "shifts", ["WebApi.Modules.Shifts.Client", "Module.Shifts"]),
-    ("DynamicFields", "dynamicfields", ["WebApi.Modules.DynamicFields.Client", "Module.DynamicFields"]),
-    ("Content", "content", ["WebApi.Modules.Content.Client", "Module.Content"]),
+    ("Organization", "organization", false, ["WebApi.Modules.Organization.Client", "Module.Organization"]),
+    ("Shifts", "shifts", false, ["WebApi.Modules.Shifts.Client", "Module.Shifts"]),
+    ("DynamicFields", "dynamicfields", false, ["WebApi.Modules.DynamicFields.Client", "Module.DynamicFields"]),
+    ("Content", "content", false, ["WebApi.Modules.Content.Client", "Module.Content"]),
+    ("NewsRoom", "newsroom", true, ["WebApi.Modules.NewsRoom.Client", "Module.NewsRoom"]),
 };
-foreach (var (name, id, clientParts) in siblings)
+foreach (var (name, id, optional, clientParts) in siblings)
 {
     var root = Path.GetFullPath(builder.Configuration[$"Playground:{name}"] ?? Path.Combine(siblingsRoot, $"Module.{name}"));
     var web = Path.Combine(root, "src", $"WebApi.Modules.{name}.Web", "bin", "Debug", "net10.0");
     var parts = clientParts.Select(p => (Part: p, Dll: Path.Combine(root, "src", p, "bin", "Debug", "net10.0", $"soft.square.net.{p}.dll"))).ToArray();
     var missing = parts.Select(p => p.Dll).Append(Path.Combine(web, $"soft.square.net.WebApi.Modules.{name}.Web.dll"))
         .Where(file => !File.Exists(file)).ToArray();
+    if (missing.Length > 0 && optional)
+    {
+        Console.WriteLine($"{name}: not loaded, there is no Debug build in {root}.");
+        continue;
+    }
     // The workflows need all of them: stop here instead of starting a platform that half works.
     if (missing.Length > 0)
         throw new InvalidOperationException(
@@ -126,7 +134,8 @@ core.WithEnvironment("Platform__DeploymentId", "elsa-playground")
     .WithEnvironment(ShiftsOrg + "ClientId", ElsaClientId)
     .WithEnvironment(ShiftsOrg + "ClientScope", "api")
     .WithEnvironment(ShiftsOrg + "ClientSecret", elsaClientSecret)
-    .WithEnvironment("Modules__Settings__content__Content__ApiBaseUrl", GatewayUrl);
+    .WithEnvironment("Modules__Settings__content__Content__ApiBaseUrl", GatewayUrl)
+    .WithEnvironment("Modules__Settings__newsroom__NewsRoom__ApiBaseUrl", GatewayUrl);
 
 // The workflow pool runs Elsa and nothing else (beside the platform's core modules). Only this pool gets the Elsa
 // database and the client secret; the host passes both to the Elsa module alone.
@@ -139,6 +148,8 @@ var workflow = AddPool("workflow", WorkflowPort)
     .WithEnvironment("Elsa__IdentityAuthority", Issuer)
     .WithEnvironment("Elsa__PlatformApiBaseUrl", GatewayUrl)
     .WithEnvironment("Modules__Settings__elsa__Elsa__PollInterval", "00:00:10")
+    // The definition that runs every approved project here. check.ps1 publishes a temporary one under this id.
+    .WithEnvironment("Modules__Settings__elsa__Elsa__Newsroom__ProjectWorkflow", "playground-newsroom-project")
     // One pool at a time creates the platform's shared tables and the dev tenants.
     .WaitFor(core);
 
@@ -211,7 +222,7 @@ internal static class PlaygroundGrants
     private static readonly string[] TenantAdmin =
     [
         "access.grants.manage", "workflow.view", "workflow.design", "workflow.run",
-        "content.*", "shifts.*", "dynamicfields.*"
+        "content.*", "shifts.*", "dynamicfields.*", "newsroom.*"
     ];
 
     /// <summary>

@@ -10,10 +10,13 @@ $Gateway = 'http://localhost:5080/'
 $Tenants = 'acme', 'globex'
 
 # The service subject of the workflows (the client id is the token's subject) and what it may do in a tenant, for the
-# whole tenant. The first four are what the coordinator calls today; content.unit.assign is for assigning work items
-# once the workflows own assignment.
+# whole tenant. The coordinator uses content.assign, content.transfer, content.publish and shifts.manage. The newsroom
+# activities use content.unit.assign (file a post in its Section, and see it), newsroom.workflow (read projects and report
+# their state), content.assign, content.publish, dynamicfields.read (Content's publish has DynamicFields check the post as
+# the caller) and org.read (Organization's members of a unit, to find its managers when a deadline passes).
 $WorkflowSubject = 'elsa-workflows'
-$WorkflowGrants = 'content.assign', 'content.transfer', 'content.publish', 'content.unit.assign', 'shifts.manage'
+$WorkflowGrants = 'content.assign', 'content.transfer', 'content.publish', 'content.unit.assign', 'shifts.manage',
+    'newsroom.workflow', 'org.read', 'dynamicfields.read'
 
 # The tenants' dev administrators. globex's is added by the playground (AppHost.cs).
 function Get-TenantAdmin([string] $tenant, [string] $platformRoot) {
