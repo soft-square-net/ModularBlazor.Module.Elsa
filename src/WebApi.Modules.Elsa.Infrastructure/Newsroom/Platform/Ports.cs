@@ -1,33 +1,56 @@
 using System.Net;
 using System.Text.Json;
-using Microsoft.Extensions.Configuration;
 using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Events;
 
 namespace soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Platform;
 
-// The small interfaces behind which the parts that later steps build are kept: bindings and routing rules (N3), the
-// load read model (N3), and NewsRoom's project state.
+// The small interfaces to NewsRoom: bindings, routing rules, the load per person and the project's state.
 
-/// <summary>Which workflow definition runs an approved project. N3 replaces this with NewsRoom's bindings.</summary>
+/// <summary>A definition to run; <paramref name="Version"/> null means its latest published version.</summary>
+public sealed record WorkflowChoice(string DefinitionId, int? Version = null);
+
+/// <summary>NewsRoom's workflow bindings, inherited up the unit tree.</summary>
 public interface IWorkflowBindings
 {
-    /// <summary>The bound definition id, or null when nothing is bound (a setup error).</summary>
-    Task<string?> ResolveAsync(ProjectApproved project, CancellationToken ct);
+    /// <summary>The main workflow of a project; null when no unit on its path binds its post kind (a setup error).</summary>
+    Task<WorkflowChoice?> ForProjectAsync(Guid projectId, CancellationToken ct);
+
+    /// <summary>The main workflow a post kind has in a unit; null when none is bound. For a dry run.</summary>
+    Task<WorkflowChoice?> ForPostKindAsync(string postKind, Guid unitId, CancellationToken ct);
+
+    /// <summary>The sub-workflow of a content kind in a unit; null when none is bound.</summary>
+    Task<WorkflowChoice?> ForContentAsync(string contentKind, Guid unitId, CancellationToken ct);
 }
 
-/// <summary>One definition for every project, from the module setting <c>Elsa:Newsroom:ProjectWorkflow</c>.</summary>
-internal sealed class SettingWorkflowBindings(IConfiguration settings) : IWorkflowBindings
+internal sealed class HttpWorkflowBindings(PlatformApi api) : IWorkflowBindings
 {
-    public const string Setting = "Elsa:Newsroom:ProjectWorkflow";
+    private sealed record Resolution(string DefinitionId, int? DefinitionVersion);
 
-    public Task<string?> ResolveAsync(ProjectApproved project, CancellationToken ct) =>
-        Task.FromResult(settings[Setting] is { Length: > 0 } definitionId ? definitionId : null);
+    public Task<WorkflowChoice?> ForProjectAsync(Guid projectId, CancellationToken ct) =>
+        ResolveAsync($"/api/newsroom/projects/{projectId:D}/workflow", ct);
+
+    public Task<WorkflowChoice?> ForPostKindAsync(string postKind, Guid unitId, CancellationToken ct) =>
+        BoundAsync("post", postKind, unitId, ct);
+
+    public Task<WorkflowChoice?> ForContentAsync(string contentKind, Guid unitId, CancellationToken ct) =>
+        BoundAsync("content", contentKind, unitId, ct);
+
+    private Task<WorkflowChoice?> BoundAsync(string kindType, string kind, Guid unitId, CancellationToken ct) =>
+        ResolveAsync(
+            $"/api/newsroom/bindings/resolve?kindType={kindType}&kind={Uri.EscapeDataString(kind)}&unitId={unitId:D}", ct);
+
+    private async Task<WorkflowChoice?> ResolveAsync(string path, CancellationToken ct)
+    {
+        var answer = await api.SendAsync(HttpMethod.Get, path, null, ct);
+        if (answer.Status == HttpStatusCode.Conflict) return null; // no binding up the path
+        if (!answer.IsSuccess)
+            throw new PlatformUnavailableException($"GET {path} answered {(int)answer.Status}: {answer.Reason()}");
+        var resolution = answer.Read<Resolution>();
+        return new WorkflowChoice(resolution.DefinitionId, resolution.DefinitionVersion);
+    }
 }
 
-/// <summary>"Contents of this kind are produced by this unit, or by a unit with this tag."</summary>
-public sealed record RoutingRuleInput(string ContentKind, Guid? UnitId = null, string? UnitTag = null);
-
-public sealed record RouteQuery(string ContentKind, IReadOnlyCollection<string> Categories, IReadOnlyList<RoutingRuleInput> Rules);
+public sealed record RouteQuery(string ContentKind, IReadOnlyCollection<string> Categories);
 
 public interface IUnitRouter
 {
@@ -35,35 +58,21 @@ public interface IUnitRouter
     Task<Guid?> RouteAsync(RouteQuery query, CancellationToken ct);
 }
 
-/// <summary>
-/// Applies the rules given to the activity, the exact content kind before "*", in their order. A rule naming a unit is
-/// taken as it is; a rule naming a tag takes the first unit with that tag, by path, that serves one of the categories
-/// (any tagged unit when the post has none). N3 keeps the rules in NewsRoom.
-/// </summary>
-internal sealed class InputUnitRouter(OrganizationModuleApi organization) : IUnitRouter
+/// <summary>NewsRoom's routing rules.</summary>
+internal sealed class HttpUnitRouter(PlatformApi api) : IUnitRouter
 {
+    private const int CategoryLimit = 50;
+
+    private sealed record Route(Guid? UnitId);
+
     public async Task<Guid?> RouteAsync(RouteQuery query, CancellationToken ct)
     {
-        var rules = query.Rules.Where(r => Matches(r.ContentKind, query.ContentKind))
-            .Concat(query.Rules.Where(r => r.ContentKind == "*" && query.ContentKind != "*"));
-        IReadOnlyList<UnitSnapshot>? units = null;
-        foreach (var rule in rules)
-        {
-            if (rule.UnitId is { } id) return id;
-            if (string.IsNullOrWhiteSpace(rule.UnitTag)) continue;
-
-            units ??= (await organization.UnitsAsync(ct)).OrderBy(u => u.Path, StringComparer.Ordinal).ToArray();
-            foreach (var unit in units.Where(u => u.Tags.Contains(rule.UnitTag, StringComparer.OrdinalIgnoreCase)))
-            {
-                if (query.Categories.Count == 0) return unit.Id;
-                var served = await organization.CategoriesAsync(unit.Id, ct);
-                if (served is not null && UnitCategories.Covers(served, query.Categories)) return unit.Id;
-            }
-        }
-
-        return null;
-
-        static bool Matches(string rule, string kind) => string.Equals(rule, kind, StringComparison.OrdinalIgnoreCase);
+        const string path = "/api/newsroom/routing/route";
+        var answer = await api.SendAsync(HttpMethod.Post, path,
+            new { contentKind = query.ContentKind, categories = query.Categories.Take(CategoryLimit) }, ct);
+        if (!answer.IsSuccess)
+            throw new PlatformUnavailableException($"POST {path} answered {(int)answer.Status}: {answer.Reason()}");
+        return answer.Read<Route>().UnitId;
     }
 }
 
@@ -79,17 +88,37 @@ public static class UnitCategories
         served.Contains(All) || categories.Any(c => served.Contains(c, StringComparer.Ordinal));
 }
 
-/// <summary>How much open work a person has. N3 replaces this with NewsRoom's read model.</summary>
+/// <summary>How much open work people have.</summary>
 public interface IShiftWorkload
 {
-    Task<int> OpenItemsAsync(string userId, CancellationToken ct);
+    /// <summary>Each person's open items; someone it knows nothing about may be left out.</summary>
+    Task<IReadOnlyDictionary<string, int>> OpenItemsAsync(IReadOnlyCollection<string> userIds, CancellationToken ct);
 }
 
-/// <summary>Counts the person's contents that are not accepted yet, from Content's list.</summary>
-internal sealed class ContentShiftWorkload(ContentModuleApi content) : IShiftWorkload
+/// <summary>NewsRoom's read model of the load per person.</summary>
+internal sealed class HttpShiftWorkload(PlatformApi api) : IShiftWorkload
 {
-    public async Task<int> OpenItemsAsync(string userId, CancellationToken ct) =>
-        (await content.AssignedToAsync(userId, ct)).Count(c => c.Stage != "accepted");
+    private const int Limit = 200;
+
+    private sealed record Load(string UserId, int OpenItems);
+
+    private sealed record Answer(IReadOnlyList<Load> Items);
+
+    public async Task<IReadOnlyDictionary<string, int>> OpenItemsAsync(
+        IReadOnlyCollection<string> userIds, CancellationToken ct)
+    {
+        const string path = "/api/newsroom/workload/query";
+        var loads = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var batch in userIds.Distinct().Chunk(Limit))
+        {
+            var answer = await api.SendAsync(HttpMethod.Post, path, new { userIds = batch }, ct);
+            if (!answer.IsSuccess)
+                throw new PlatformUnavailableException($"POST {path} answered {(int)answer.Status}: {answer.Reason()}");
+            foreach (var item in answer.Read<Answer>().Items) loads[item.UserId] = item.OpenItems;
+        }
+
+        return loads;
+    }
 }
 
 /// <summary>The states of a post project.</summary>
@@ -109,7 +138,9 @@ public static class ProjectStates
 /// <summary>The part of NewsRoom's project that the workflows read.</summary>
 /// <param name="SectionId">The Section the moderator chose, which the workflow files the post in.</param>
 /// <param name="ApprovalNumber">1, and one more each time a moderator answers NeedsModeration.</param>
-public sealed record ProjectSnapshot(Guid Id, string State, Guid? SectionId, int? PostId, int ApprovalNumber);
+public sealed record ProjectSnapshot(
+    Guid Id, string State, Guid? SectionId, int? PostId, int ApprovalNumber, string? ProposalAuthorId = null,
+    string? PostKind = null);
 
 /// <summary>NewsRoom's project state API.</summary>
 public interface INewsRoomProjects

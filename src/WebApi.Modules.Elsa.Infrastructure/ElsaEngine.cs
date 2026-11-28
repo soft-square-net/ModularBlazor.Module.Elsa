@@ -15,7 +15,9 @@ using Elsa.Tenants.Extensions;
 using Elsa.Workflows.Runtime.Distributed.Extensions;
 using Medallion.Threading.Postgres;
 using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom;
+using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.DryRun;
 using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Runtime;
+using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Workflows;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Hosting;
@@ -151,6 +153,7 @@ internal sealed class ElsaEngine : IAsyncDisposable
             elsa.UseWorkflowsApi();
             elsa.UseHttp();
             elsa.AddActivitiesFrom<ElsaEngine>();
+            DefaultWorkflows.Register(elsa);
             configure?.Invoke(elsa);
         });
         services.AddSingleton<LocalScheduler>();
@@ -167,7 +170,11 @@ internal sealed class ElsaEngine : IAsyncDisposable
         app.UseAuthorization();
         app.UseWorkflows(); // HTTP workflow triggers, under /workflows
         // The API, under /elsa/api. Not UseWorkflowsApi: it needs a builder that is also the route builder.
-        app.UseEndpoints(endpoints => endpoints.MapWorkflowsApi());
+        app.UseEndpoints(endpoints =>
+        {
+            endpoints.MapWorkflowsApi();
+            DryRunEndpoint.Map(endpoints);
+        });
         return app.Build();
     }
 

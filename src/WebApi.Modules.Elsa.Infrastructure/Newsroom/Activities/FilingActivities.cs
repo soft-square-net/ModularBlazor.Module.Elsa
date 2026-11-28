@@ -10,7 +10,7 @@ using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Runtime;
 
 namespace soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Activities;
 
-[Activity("SoftSquare.Newsroom", "Newsroom", "Finds the unit that produces a content kind.", DisplayName = "Route to unit")]
+[Activity("SoftSquare.Newsroom", "Newsroom", "Finds the unit that produces a content kind, by NewsRoom's routing rules.", DisplayName = "Route to unit")]
 [FlowNode(Routed, NoRoute)]
 public sealed class RouteToUnit : NewsroomActivity
 {
@@ -20,17 +20,13 @@ public sealed class RouteToUnit : NewsroomActivity
     public Input<string> ContentKind { get; set; } = default!;
     public Input<ICollection<string>?> Categories { get; set; } = default!;
 
-    /// <summary>The routing rules, until NewsRoom keeps them.</summary>
-    public Input<ICollection<RoutingRuleInput>> Rules { get; set; } = default!;
-
     public Output<string?> UnitId { get; set; } = default!;
 
     protected override async Task<WaitStep> StepAsync(ActivityExecutionContext context, CancellationToken ct)
     {
         var unit = await context.GetRequiredService<IUnitRouter>().RouteAsync(new RouteQuery(
             Value(context, ContentKind) ?? "",
-            Value(context, Categories)?.ToArray() ?? [],
-            Value(context, Rules)?.ToArray() ?? []), ct);
+            Value(context, Categories)?.ToArray() ?? []), ct);
         context.Set(UnitId, unit?.ToString("D"));
         return WaitStep.Done(unit is null ? NoRoute : Routed);
     }
@@ -43,6 +39,16 @@ internal static class Filing
 
     public static string Of(IEnumerable<string> categories, Guid? postUnit, Guid? section) =>
         $"{string.Join(',', categories.Order(StringComparer.Ordinal))}|{postUnit:N}|{section:N}";
+
+    /// <summary>
+    /// Whether the filing must be checked again: a moderator approved the project again, or the post's categories or
+    /// unit, or the project's Section, are not what the check saw.
+    /// </summary>
+    /// <param name="checkedAs">What the check saw; null when nothing was checked.</param>
+    public static bool Changed(
+        string? checkedAs, int checkedApproval, ProjectSnapshot project, PostSnapshot post) =>
+        project.ApprovalNumber > checkedApproval ||
+        (checkedAs is not null && checkedAs != Of(post.Categories, post.UnitId, project.SectionId));
 }
 
 [Activity("SoftSquare.Newsroom", "Newsroom",
@@ -135,7 +141,7 @@ public sealed class EnsurePostInUnitCategories : NewsroomActivity
 [Activity("SoftSquare.Newsroom", "Newsroom",
     "Waits until the post's filing must be checked again: its categories or unit changed, or a moderator approved the project again.",
     DisplayName = "Wait for refiling")]
-[FlowNode(Refiled)]
+[FlowNode(Refiled, ProjectEnded)]
 public sealed class WaitForRefiling : NewsroomActivity
 {
     public const string Refiled = "Refiled";
@@ -150,15 +156,16 @@ public sealed class WaitForRefiling : NewsroomActivity
         var wait = WaitStep.For(Subjects.Project(projectId), Subjects.Post(postId));
         var project = await ProjectAsync(context, projectId, ct);
 
+        if (EndOf(project) is { } end) return end;
+
         // While the moderator has not answered, their changes to the post are not for the workflow to act on.
-        if (ProjectStates.Is(project.State, ProjectStates.NeedsModeration) ||
-            ProjectStates.Is(project.State, ProjectStates.Killed)) return wait;
+        if (ProjectStates.Is(project.State, ProjectStates.NeedsModeration)) return wait;
         if (project.ApprovalNumber > ApprovalOf(context, project)) return WaitStep.Done(Refiled);
 
         var post = await context.GetRequiredService<ContentModuleApi>().PostAsync(postId, ct)
             ?? throw new PlatformUnavailableException($"Content does not serve post {postId}.");
         var checkedAs = Remembered(context, Filing.Property);
-        return checkedAs is null || checkedAs != Filing.Of(post.Categories, post.UnitId, project.SectionId)
+        return checkedAs is null || Filing.Changed(checkedAs, ApprovalOf(context, project), project, post)
             ? WaitStep.Done(Refiled)
             : wait;
     }

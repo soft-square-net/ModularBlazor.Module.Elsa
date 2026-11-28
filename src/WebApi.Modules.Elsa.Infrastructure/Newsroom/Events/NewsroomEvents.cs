@@ -9,7 +9,8 @@ namespace soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Events;
 
 /// <summary>
 /// <c>newsroom.project-approved.v1</c>, a copy of NewsRoom.Contracts 1.0.0-preview.1: published once per project, when
-/// it is approved and its Content draft exists. <c>project-reapproved</c> carries the same record.
+/// it is approved and its Content draft exists. <c>project-reapproved</c> and <c>project-binding-available</c> carry the
+/// same record.
 /// </summary>
 /// <param name="SectionId">The unit the post is to be produced in.</param>
 public sealed record ProjectApproved(
@@ -36,6 +37,7 @@ internal static class NewsroomEventTypes
     public const string ProjectApproved = "newsroom.project-approved.v1";
     public const string ProjectReapproved = "newsroom.project-reapproved.v1";
     public const string ProjectStateChanged = "newsroom.project-state-changed.v1";
+    public const string ProjectBindingAvailable = "newsroom.project-binding-available.v1";
 
     /// <summary>What the module subscribes to; the manifest and the handler registrations both use it.</summary>
     public static readonly IReadOnlyList<string> Subscriptions =
@@ -43,9 +45,13 @@ internal static class NewsroomEventTypes
         ProjectApproved,
         ProjectReapproved,
         ProjectStateChanged,
+        ProjectBindingAvailable,
         "content.work-item-*.v1",
         "content.post-*.v1",
         "shifts.checked-in.v1",
+        "shifts.checked-out.v1",
+        "shifts.handover.v1",
+        "shifts.ended.v1",
         "shifts.published.v1",
         "shifts.member-added.v1"
     ];

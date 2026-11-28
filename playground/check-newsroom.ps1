@@ -1,20 +1,21 @@
 ﻿<#
 .SYNOPSIS
-  The newsroom check: a project approved in NewsRoom runs a temporary workflow of the newsroom activities.
+  The newsroom check: projects approved in NewsRoom run the default newsroom workflows.
 
 .DESCRIPTION
   Runs against a playground that is already running, with NewsRoom loaded (dotnet run --project playground). As tenant
   acme it prepares what a project needs (a Section in Organization, a press and a category in Content, the post kind and
-  the proposal form in DynamicFields), publishes a temporary workflow under the id the playground binds to approved
-  projects, and approves a proposal. Everything after the approval is the real chain: NewsRoom publishes the event,
-  RabbitMQ delivers it, Elsa's subscriber starts the workflow, and the activities call the other modules as
-  elsa-workflows:
+  the proposal form in DynamicFields, a shift, a routing rule in NewsRoom). Everything after an approval is the real
+  chain: NewsRoom publishes the event, RabbitMQ delivers it, Elsa's subscriber starts the workflow, and the activities
+  call the other modules as elsa-workflows. It checks:
 
-    Route to unit -> Ensure post in unit categories -> Assign in shift -> Deadline -> Wait for stage -> Desk review
-    -> Publish -> Notify
+    - no binding: no workflow, a setup error, and a dry run that says why; the binding's event then starts it;
+    - newsroom-post and its newsroom-content sub-workflow, from filing to publication, with one return by the desk;
+    - a dry run that returns the steps and changes nothing;
+    - a killed project: the workflow and its sub-workflow are cancelled.
 
-  The editor's work (checking in, submitting, approving the post) is done here, and Content's events resume the
-  workflow. Safe to run again on the same data. Exits with 1 when a check fails. DEVELOPMENT ONLY.
+  The people's work (checking in, writing, the desk) is done here, and the modules' events resume the workflows. Safe
+  to run again on the same data. Exits with 1 when a check fails. DEVELOPMENT ONLY.
 #>
 param([string] $PlatformRoot, [int] $StartTimeoutSeconds = 600)
 
@@ -29,7 +30,6 @@ function Check([bool] $condition, [string] $text) {
 }
 
 $Tenant = 'acme'
-$Definition = 'playground-newsroom-project'   # AppHost.cs binds approved projects to it
 $Category = '7b0f3f6e-0c1a-4a52-9d8e-1f0000000001'
 $PressId = '7b0f3f6e-0c1a-4a52-9d8e-1f00000000a0'
 $Central = $Gateway + 'api/organization/'
@@ -110,11 +110,11 @@ if ((Api GET 'dynamicfields/fields/proposal.default/versions/0' -AllowFailure).S
 }
 
 # Content approves a post only with all its kind's required fields, and post.news requires an uploaded image: the
-# projects here are of a kind that requires only the headline NewsRoom fills in.
-$PostKind = 'post.elsacheck'
+# projects here are of a kind that requires only the headline NewsRoom fills in, and takes lines of text as contents.
+$PostKind = 'post.elsatext'
 if ((Api GET "dynamicfields/fields/$PostKind/versions/0" -AllowFailure).Status -ne 200) {
     $kind = @{ key = $PostKind; draft = @{
-            title = 'Elsa check post'; schemaType = 'NewsArticle'; canBeRoot = $true; style = @(); children = @(); urlPrefix = 'elsa-check'
+            title = 'Elsa check post'; schemaType = 'NewsArticle'; canBeRoot = $true; style = @(); children = @(@{ fieldKey = 'block.text'; version = 1; min = 0 }); urlPrefix = 'elsa-text'
             properties = @(@{ key = 'headline'; label = 'Headline'; kind = 'Text'; required = $true; schemaProperty = 'headline'; maxLength = 300 }) } }
     $created = Api POST 'dynamicfields/fields' $kind
     Api POST "dynamicfields/fields/$PostKind/publish" @{ version = $created.Json.version } | Out-Null
@@ -127,13 +127,10 @@ $proposal = (Api POST 'newsroom/proposals' @{ unitId = $section.id; values = @{ 
 $proposal = (Api POST "newsroom/proposals/$($proposal.id)/submit" @{ version = $proposal.version }).Json
 Check ($proposal.state -eq 'Submitted') "proposal $($proposal.id) is $($proposal.state)"
 
-Step 'A content item to produce, and a running shift with a writer checked in'
+Step 'A running shift with a writer, not yet checked in'
 # Shifts reads the unit's members as the caller, which takes org.read on the unit and the units above it.
 $held = @((Api GET "identity/grants?userId=$adminSub").Json) | Where-Object { $_.permission -eq 'org.read' -and $_.scope -eq 'tenant' }
 if (-not $held) { Api POST 'identity/grants' @{ userId = $adminSub; permission = 'org.read'; scope = 'tenant' } | Out-Null }
-$values = @{ nodeId = [guid]::NewGuid().ToString(); schemaId = 'post.news'; schemaVersion = 1; content = @{ }; style = @{ }; children = @(); postKind = 'post.news' }
-$item = (Api POST 'content/contents' @{ categoryId = $Category; values = $values }).Json
-Check ($item.stage -ne $null -and -not $item.assigneeId) "content $($item.id) is $($item.stage), assigned to nobody"
 # An earlier run's shift may still have the writer checked in: the assignment must start with nobody there.
 $from = [Uri]::EscapeDataString([DateTimeOffset]::UtcNow.AddDays(-2).ToString('o'))
 $to = [Uri]::EscapeDataString([DateTimeOffset]::UtcNow.AddDays(1).ToString('o'))
@@ -142,8 +139,8 @@ foreach ($old in @((Api GET "shifts/shifts?from=$from&to=$to").Json) | Where-Obj
         Api POST "shifts/shifts/$($old.id)/check-out" | Out-Null
     }
 }
-# The role's permissions are held while its shift runs: Content's desk accepts and assigns a post, and the editor reviews
-# it, only with these held in the shift.
+# AppHost.cs makes this the role that produces contents. Its permissions are held while its shift runs: Content's desk
+# accepts and assigns a post, and the editor reviews it, only with these held in the shift.
 $role = @{ key = 'lead-editor'; nameEn = 'Lead editor'; nameAr = 'كبير المحررين'; permissions = @('content.accept', 'content.assign', 'content.review'); isLead = $true }
 $r = Api POST 'shifts/roles' $role -AllowFailure
 if ($r.Status -ge 400 -and $r.Status -ne 409) { throw "Creating the role -> $($r.Status): $($r.Text)" }
@@ -152,91 +149,127 @@ $shift = (Api POST 'shifts/shifts' @{ unitId = $section.id; startsAt = [DateTime
 # Publishing needs the unit's members, which acme's replica may still be pulling.
 Api POST "shifts/shifts/$($shift.id)/publish" | Out-Null
 
-Step 'A temporary workflow of the newsroom activities, under the id approved projects run'
+Step 'NewsRoom: a routing rule for the content kind, and no binding for the post kind yet'
+$ContentKind = 'block.text'   # its one field is all that submitting such a content takes
+$r = Api POST 'newsroom/routing-rules' @{ contentKind = $ContentKind; unitId = $section.id } -AllowFailure
+$rule = @((Api GET 'newsroom/routing-rules').Json) | Where-Object contentKind -eq $ContentKind | Select-Object -First 1
+if ($rule -and $rule.unitId -ne $section.id) {
+    Api PUT "newsroom/routing-rules/$($rule.id)" @{ version = $rule.version; contentKind = $ContentKind; unitId = $section.id } | Out-Null
+}
+Check ($null -ne $rule) "a routing rule sends $ContentKind to the Section ($($r.Status))"
+foreach ($old in @((Api GET "newsroom/bindings?kindType=post&kind=$PostKind").Json) | Where-Object { $_ }) {
+    Api DELETE "newsroom/bindings/$($old.id)?version=$($old.version)" | Out-Null
+}
+
 $Elsa = 'elsa/elsa/api'
-function Text([string] $value) { @{ typeName = 'String'; expression = @{ type = 'Literal'; value = $value } } }
-function Json($value) { @{ typeName = 'Object'; expression = @{ type = 'Object'; value = (ConvertTo-Json -InputObject $value -Depth 5 -Compress) } } }
-function Activity([string] $type, [string] $id, [hashtable] $inputs = @{}) {
-    $node = @{ type = "SoftSquare.Newsroom.$type"; version = 1; id = $id }
-    foreach ($name in $inputs.Keys) { $node[$name] = $inputs[$name] }
-    return $node
-}
-# The stage the check can reach with an empty content item: submitting one takes all its kind's fields.
-$produced = @('in-progress', 'submitted', 'in-review', 'accepted')
-$root = @{ type = 'Elsa.Sequence'; version = 1; id = 'sequence'; activities = @(
-        (Activity 'RouteToUnit' 'route' @{ contentKind = (Text 'text'); rules = (Json @(@{ contentKind = 'text'; unitId = $section.id })) }),
-        (Activity 'EnsurePostInUnitCategories' 'ensure'),
-        (Activity 'AssignInShift' 'assign' @{ contentId = (Text $item.id); unitId = (Text $section.id); roleKey = (Text 'lead-editor') }),
-        (Activity 'Deadline' 'deadline' @{ contentId = (Text $item.id); stages = (Json $produced); dueIn = @{ typeName = 'TimeSpan'; expression = @{ type = 'Literal'; value = '00:00:05' } } }),
-        (Activity 'WaitForStage' 'stage' @{ contentId = (Text $item.id); stages = (Json $produced) }),
-        (Activity 'DeskReview' 'desk'),
-        (Activity 'PublishPost' 'publish'),
-        (Activity 'Notify' 'notify' @{ userId = (Text $adminSub); message = (Text 'The story is out.') })) }
-$r = Api POST "$Elsa/workflow-definitions" @{ publish = $true; model = @{ definitionId = $Definition; name = 'Playground newsroom check'; root = $root } } -AllowFailure
-Check ($r.Status -eq 200) "published $Definition ($($r.Status)$(if ($r.Status -ne 200) { ": $($r.Text)" }))"
-
-Step 'The moderator approves the proposal; the event starts the workflow'
-$r = Api POST "newsroom/proposals/$($proposal.id)/approve" @{ version = $proposal.version; projects = @(@{ postKind = $PostKind; sectionId = $section.id; categories = @($Category) }) }
-$project = (Wait-Until {
-    $found = @((Api GET "newsroom/projects?proposalId=$($proposal.id)").Json.items) | Where-Object postId | Select-Object -First 1
-    if ($found) { $found }
-} 'the project and its draft post' 60)
-Check ($true) "project $($project.id) has the draft post $($project.postId)"
-
-function Get-Instance { @((Api GET "$Elsa/workflow-instances?correlationId=newsroom-project:$($project.id)").Json.items | Where-Object { $_ }) }
-function Get-ProjectState { (Api GET "newsroom/projects/$($project.id)").Json.state }
-function Test-Reached([string] $activity) {
-    $r = Api GET "$Elsa/activity-executions/list?workflowInstanceId=$($script:instanceId)&activityNodeId=Workflow1:sequence:$activity" -AllowFailure
-    return $r.Status -eq 200 -and @($r.Json.items | Where-Object { $_ }).Count -gt 0
-}
+function Get-Instances($project) { @((Api GET "$Elsa/workflow-instances?correlationId=newsroom-project:$($project.id)").Json.items | Where-Object { $_ }) }
+function Get-Project($project) { (Api GET "newsroom/projects/$($project.id)").Json }
 # Waits for something the workflow should do; a failed check, not an exception, when it does not.
 function Expect([scriptblock] $probe, [string] $text, [int] $seconds = 30) {
     $started = Get-Date
     try { Wait-Until $probe $text $seconds | Out-Null; Check $true "$text ($([int]((Get-Date) - $started).TotalSeconds) s)" }
-    catch { Check $false "$text. $_"; $script:instance = Get-Instance; $script:instance | Format-List status, subStatus, incidentCount | Out-Host; throw 'The workflow did not go on.' }
+    catch { Check $false "$text. $_"; if ($script:project) { Get-Instances $script:project | Format-List definitionId, status, subStatus, incidentCount | Out-Host }; throw 'The workflow did not go on.' }
 }
 
-Expect { @(Get-Instance).Count -eq 1 } 'one workflow instance started for the project' 60
-$script:instanceId = (Get-Instance)[0].id
-Expect { Test-Reached 'assign' } 'it routed, filed the post and came to the assignment'
+# Approves the proposal into one project, and attaches one content, which the post requires, to the project's draft post.
+function Approve-Proposal($proposal) {
+    Api POST "newsroom/proposals/$($proposal.id)/approve" @{ version = $proposal.version; projects = @(@{ postKind = $PostKind; sectionId = $section.id; categories = @($Category) }) } | Out-Null
+    return (Wait-Until {
+        $found = @((Api GET "newsroom/projects?proposalId=$($proposal.id)").Json.items) | Where-Object postId | Select-Object -First 1
+        if ($found) { $found }
+    } 'the project and its draft post' 60)
+}
+function Add-Content($project) {
+    $post = (Api GET "content/posts/$($project.postId)").Json
+    $values = @{ nodeId = [guid]::NewGuid().ToString(); schemaId = $ContentKind; schemaVersion = 1; content = @{ text = 'Elsa check content' }; style = @{ }; children = @(); postKind = $ContentKind }
+    return (Api POST 'content/contents' @{ categoryId = $Category; values = $values; postId = $project.postId; postVersion = $post.version; required = $true }).Json
+}
+function Invoke-DryRun($project) { Api POST 'elsa/newsroom/dry-run' @{ postId = $project.postId; unitId = $section.id } -AllowFailure }
+
+Step 'The moderator approves the proposal before any workflow is bound'
+$script:project = Approve-Proposal $proposal
+Check ($true) "project $($project.id) has the draft post $($project.postId)"
+$item = Add-Content $project
+Check ($item.stage -ne $null -and -not $item.assigneeId) "the post has content $($item.id) ($($item.fieldKey)), $($item.stage), assigned to nobody"
+Start-Sleep -Seconds 8
+Check (@(Get-Instances $project).Count -eq 0) 'no workflow started'
+Check ([bool](Get-Project $project).setupError) "NewsRoom reports the setup error: $((Get-Project $project).setupError)"
+$r = Invoke-DryRun $project
+Check ($r.Status -eq 200 -and @($r.Json.problems).Count -gt 0 -and -not $r.Json.workflow) "a dry run says why ($($r.Status): $(@($r.Json.problems) -join ' '))"
+
+Step 'The default workflow is bound; NewsRoom''s event starts it'
+$r = Api POST 'newsroom/bindings' @{ kindType = 'post'; kind = $PostKind; unitId = $section.id; definitionId = 'newsroom-post' } -AllowFailure
+Check ($r.Status -eq 201) "bound $PostKind to newsroom-post ($($r.Status)$(if ($r.Status -ne 201) { ": $($r.Text)" }))"
+Expect { @(Get-Instances $project).Count -eq 2 } 'the main workflow and the content''s sub-workflow started' 60
+$instances = Get-Instances $project
+Check ((@($instances.definitionId | Sort-Object) -join ',') -eq 'newsroom-content,newsroom-post') "they are $(@($instances.definitionId) -join ' and ')"
+$mainId = ($instances | Where-Object definitionId -eq 'newsroom-post').id
 Expect { (Api GET "content/posts/$($project.postId)").Json.unitId -eq $section.id } 'the post is filed in the Section'
-Expect { (Get-ProjectState) -eq 'InProduction' } 'NewsRoom has the project InProduction'
+Expect { (Get-Project $project).state -eq 'InProduction' } 'NewsRoom has the project InProduction'
+Expect { (Api GET "content/contents/$($item.id)").Json.unitId -eq $section.id } 'the content went to the unit its kind is routed to'
 Check (-not (Api GET "content/contents/$($item.id)").Json.assigneeId) 'with nobody checked in, the content is not assigned'
 
-Step 'The writer checks in; the shift event resumes the assignment'
+Step 'A dry run of the bound workflow changes nothing'
+$r = Invoke-DryRun $project
+$steps = @($r.Json.workflow.steps.activityId)
+Check ($r.Status -eq 200 -and ($steps -join ',') -eq 'ensure,produce,desk,publish,announce') "the steps are $($steps -join ', ') ($($r.Status)$(if ($r.Status -ne 200) { ": $($r.Text)" }))"
+$sub = @($r.Json.workflow.steps | Where-Object activityId -eq 'produce').steps
+Check (@($sub.steps.activityId) -join ',' -eq 'file,work') "and the content's: $(@($sub.steps.activityId) -join ', ')"
+Check (@(Get-Instances $project).Count -eq 2 -and -not (Api GET "content/contents/$($item.id)").Json.assigneeId) 'no instance and no assignment came of it'
+
+Step 'The writer checks in; the shift event resumes the sub-workflow'
 Api POST "shifts/shifts/$($shift.id)/check-in" | Out-Null
 Expect { (Api GET "content/contents/$($item.id)").Json.assigneeId -eq $adminSub } 'the content is assigned to the writer on shift' 45
 
-Step 'Nobody submits in time: the deadline fires and the workflow waits on'
-Expect { Test-Reached 'stage' } 'the deadline passed and escalated'
+Step 'The content is written and accepted; Content''s events resume both workflows'
+foreach ($action in 'start', 'submit', 'review', 'accept') {
+    $current = (Api GET "content/contents/$($item.id)").Json
+    if ($current.stage -eq 'accepted') { break }
+    $r = Api POST "content/contents/$($item.id)/act" @{ action = $action; version = $current.version } -AllowFailure
+    Write-Host "        content '$action' -> $($r.Status) $(if ($r.Status -eq 200) { $r.Json.stage } else { $r.Text })"
+}
+Check ((Api GET "content/contents/$($item.id)").Json.stage -eq 'accepted') 'the content is accepted'
+Expect { (Get-Instances $project | Where-Object definitionId -eq 'newsroom-content').status -eq 'Finished' } 'the sub-workflow finished'
+Expect { (Get-Project $project).state -eq 'ReadyForDesk' } 'NewsRoom has the project ReadyForDesk'
 
-Step 'The writer starts the work; Content''s event resumes the workflow'
-$current = (Api GET "content/contents/$($item.id)").Json
-$r = Api POST "content/contents/$($item.id)/act" @{ action = 'start'; version = $current.version } -AllowFailure
-Check ($r.Status -eq 200) "the writer started the content ($($r.Status)$(if ($r.Status -ne 200) { ": $($r.Text)" }))"
-$current = $r.Json
-Expect { Test-Reached 'desk' } "the content is $($current.stage), and the workflow came to the desk" 20
-Expect { (Get-ProjectState) -eq 'ReadyForDesk' } 'NewsRoom has the project ReadyForDesk'
-
-Step 'The desk approves the post; the workflow publishes it'
+Step 'The desk returns the post once, then approves it; the workflow publishes it'
 function Move-Post([string] $action, [hashtable] $more = @{}) {
     $post = (Api GET "content/posts/$($project.postId)").Json
     $r = Api POST "content/posts/$($project.postId)/$action" (@{ version = $post.version } + $more) -AllowFailure
     Check ($r.Status -eq 200) "desk: $action ($($r.Status)$(if ($r.Status -ne 200) { ": $($r.Text)" }))"
 }
+function Send-ToReview {
+    Move-Post 'submit'
+    Move-Post 'accept' @{ shiftId = "$($shift.id)" }
+    Move-Post 'assign' @{ shiftId = "$($shift.id)"; assigneeId = $adminSub }
+}
+Send-ToReview
+Move-Post 'return' @{ note = 'Once more.' }
+Expect { (Get-Project $project).state -eq 'InProduction' } 'the returned post is in production again' 45
 Move-Post 'submit'
+Expect { (Get-Project $project).state -eq 'ReadyForDesk' } 'and back at the desk once submitted' 45
 Move-Post 'accept' @{ shiftId = "$($shift.id)" }
 Move-Post 'assign' @{ shiftId = "$($shift.id)"; assigneeId = $adminSub }
 Move-Post 'approve'
-Expect { (Api GET "content/posts/$($project.postId)").Json.state -eq 'Published' } 'elsa-workflows published the post'
-Expect { (Get-Instance)[0].status -eq 'Finished' } 'the workflow finished'
-$finished = (Get-Instance)[0]
-Check ($finished.subStatus -eq 'Finished' -and $finished.incidentCount -eq 0) "with no incidents ($($finished.subStatus), $($finished.incidentCount))"
-Expect { (Get-ProjectState) -eq 'Published' } 'NewsRoom has the project Published'
-Check (@(Get-Instance).Count -eq 1) 'there is still one instance for the project'
+Expect { (Api GET "content/posts/$($project.postId)").Json.state -eq 'Published' } 'elsa-workflows published the post' 45
+Expect { @(Get-Instances $project | Where-Object status -ne 'Finished').Count -eq 0 } 'both workflows finished' 45
+$finished = Get-Instances $project
+Check (@($finished | Where-Object { $_.subStatus -ne 'Finished' -or $_.incidentCount -ne 0 }).Count -eq 0) 'with no incidents'
+Expect { (Get-Project $project).state -eq 'Published' } 'NewsRoom has the project Published'
+Check (@(Get-Instances $project).Count -eq 2) 'there are still two instances for the project'
 
-# The workflow was temporary.
-Api DELETE "$Elsa/workflow-definitions/$Definition" -AllowFailure | Out-Null
+Step 'A second project is killed while its content waits: both workflows are cancelled'
+Api POST "shifts/shifts/$($shift.id)/check-out" | Out-Null
+$second = (Api POST 'newsroom/proposals' @{ unitId = $section.id; values = @{ title = "Elsa check $([guid]::NewGuid().ToString('N').Substring(0, 8))" }; suggestedCategories = @($Category) }).Json
+$second = (Api POST "newsroom/proposals/$($second.id)/submit" @{ version = $second.version }).Json
+$script:project = Approve-Proposal $second
+Expect { @(Get-Instances $project).Count -eq 1 } 'a binding that exists starts the workflow on approval' 60
+$null = Add-Content $project
+# The post gained a content: its event makes the main workflow start the sub-workflow.
+Expect { @(Get-Instances $project).Count -eq 2 } 'the added content gets its sub-workflow' 60
+$r = Api POST "newsroom/projects/$($project.id)/kill" @{ version = (Get-Project $project).version; reason = 'Elsa check' } -AllowFailure
+Check ($r.Status -lt 300) "killed the project ($($r.Status)$(if ($r.Status -ge 300) { ": $($r.Text)" }))"
+Expect { @(Get-Instances $project | Where-Object subStatus -ne 'Cancelled').Count -eq 0 } 'both workflows are cancelled' 45
 
 Write-Host ''
 if ($script:failed -gt 0) { Write-Host "$script:failed check(s) failed." -ForegroundColor Red; exit 1 }

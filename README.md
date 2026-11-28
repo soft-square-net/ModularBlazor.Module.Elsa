@@ -92,18 +92,19 @@ playground that is already running, use `-Phase Start`, restart it, then `-Phase
 
 ### The newsroom check
 
-With the playground running and `Module.NewsRoom` built:
+With the playground running and `Module.NewsRoom` (with its bindings, routing and workload API) built:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File playground\check-newsroom.ps1
 ```
 
-Add `-PlatformRoot <path>` for a platform checkout elsewhere. It prepares a Section, a press, a category, a post kind
-and a running shift, publishes a temporary workflow of the [newsroom activities](src/README.md#newsroom-workflows),
-and approves a proposal. It then checks that the real events start and resume one instance, which files the post,
-assigns the content to the person who checks in, escalates a missed deadline, waits for the desk, publishes and
-finishes without incidents. It plays the writer and the desk itself. It leaves its data behind (a central organization
-`elsa-playground` with a seed for `acme`, proposals, posts, shifts) and can be run again.
+Add `-PlatformRoot <path>` for a platform checkout elsewhere. It prepares a Section, a press, a category, a post kind, a
+shift and a routing rule, and approves a proposal while no workflow is bound: none starts, NewsRoom reports the setup
+error and a [dry run](src/README.md#dry-run) says why. It then binds the post kind to `newsroom-post` and checks that
+NewsRoom's event starts the [default workflows](src/README.md#default-workflows), and that the real events take the
+post from filing, through its content's sub-workflow and one return by the desk, to publication. A second project is
+killed to check that its sub-workflow is cancelled too. It plays the writer and the desk itself. It leaves its data
+behind (a central organization `elsa-playground` with a seed for `acme`, proposals, posts, shifts) and can be run again.
 
 ## Branches
 

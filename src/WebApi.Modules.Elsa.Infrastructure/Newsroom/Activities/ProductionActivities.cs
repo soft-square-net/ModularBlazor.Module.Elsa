@@ -15,7 +15,7 @@ namespace soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Activities
 [Activity("SoftSquare.Newsroom", "Newsroom",
     "Gives the content to someone: waits for the unit's manager, then picks the least loaded holder of the role who is checked in to a running shift.",
     DisplayName = "Assign in shift")]
-[FlowNode(Assigned)]
+[FlowNode(Assigned, ProjectEnded)]
 public sealed class AssignInShift : NewsroomActivity
 {
     public const string Assigned = "Assigned";
@@ -34,41 +34,26 @@ public sealed class AssignInShift : NewsroomActivity
 
     protected override async Task<WaitStep> StepAsync(ActivityExecutionContext context, CancellationToken ct)
     {
-        const string AssignAfter = "assignAfter";
         var api = context.GetRequiredService<ContentModuleApi>();
-        var contentId = RequiredId(context, ContentId, nameof(ContentId));
+        var contentId = RequiredContent(context, ContentId);
         var role = Value(context, RoleKey) is { Length: > 0 } key
             ? key
             : throw new InvalidOperationException("The activity needs a RoleKey.");
+        var assignAfter = KeptTime(context, "assignAfter", () => Now(context) + (Value(context, ManagerDelay) ?? TimeSpan.Zero));
+        if (await ProjectEndAsync(context, ct) is { } end) return end;
 
-        // Counted from the first look, and kept, so that a restart does not give the manager the delay again.
-        if (context.GetProperty<string>(AssignAfter) is not { } stored)
-        {
-            stored = (Now(context) + (Value(context, ManagerDelay) ?? TimeSpan.Zero)).ToString("O", CultureInfo.InvariantCulture);
-            context.SetProperty(AssignAfter, stored);
-        }
-
-        var assignAfter = DateTimeOffset.Parse(stored, CultureInfo.InvariantCulture);
         var content = await api.ContentAsync(contentId, ct)
             ?? throw new PlatformUnavailableException($"Content does not serve content {contentId}.");
         if (!string.IsNullOrEmpty(content.AssigneeId)) return Done(content.AssigneeId);
-        if (Now(context) < assignAfter) return WaitStep.For(Subjects.Content(contentId)).Until(assignAfter);
+        if (Now(context) < assignAfter) return WaitOn(context, Subjects.Content(contentId)).Until(assignAfter);
 
         var unitId = UnitInput(context, UnitId) ?? content.UnitId ?? RememberedUnit(context)
             ?? throw new InvalidOperationException($"Content {contentId} has no unit whose shift could take it.");
-        var wait = WaitStep.For(Subjects.Content(contentId), Subjects.Unit(unitId)).Until(Soon(context));
+        var wait = WaitOn(context, Subjects.Content(contentId), Subjects.Unit(unitId)).Until(Soon(context));
 
         var shifts = await context.GetRequiredService<ShiftsModuleApi>().RunningAsync(unitId, ct);
-        var candidates = shifts.SelectMany(s => s.Rota)
-            .Where(m => string.Equals(m.RoleKey, role, StringComparison.OrdinalIgnoreCase) &&
-                        m is { CheckedInAt: not null, CheckedOutAt: null })
-            .Select(m => m.UserId).Distinct().ToArray();
-        if (candidates.Length == 0) return wait;
-
-        var workload = context.GetRequiredService<IShiftWorkload>();
-        var loads = new List<(int Load, string UserId)>();
-        foreach (var userId in candidates) loads.Add((await workload.OpenItemsAsync(userId, ct), userId));
-        var chosen = loads.OrderBy(l => l.Load).ThenBy(l => l.UserId, StringComparer.Ordinal).First().UserId;
+        if (await ShiftPicker.LeastLoadedAsync(context, shifts, role, null, ct) is not { } picked) return wait;
+        var chosen = picked.UserId;
 
         var answer = await api.AssignAsync(content, chosen, ct);
         if (answer.IsSuccess) return Done(chosen);
@@ -86,7 +71,7 @@ public sealed class AssignInShift : NewsroomActivity
 }
 
 [Activity("SoftSquare.Newsroom", "Newsroom", "Waits until the content reaches one of the stages.", DisplayName = "Wait for stage")]
-[FlowNode(Reached)]
+[FlowNode(Reached, ProjectEnded)]
 public sealed class WaitForStage : NewsroomActivity
 {
     public const string Reached = "Reached";
@@ -101,10 +86,11 @@ public sealed class WaitForStage : NewsroomActivity
 
     protected override async Task<WaitStep> StepAsync(ActivityExecutionContext context, CancellationToken ct)
     {
-        var contentId = RequiredId(context, ContentId, nameof(ContentId));
+        var contentId = RequiredContent(context, ContentId);
+        if (await ProjectEndAsync(context, ct) is { } end) return end;
         var content = await context.GetRequiredService<ContentModuleApi>().ContentAsync(contentId, ct)
             ?? throw new PlatformUnavailableException($"Content does not serve content {contentId}.");
-        if (!Includes(Value(context, Stages), content.Stage)) return WaitStep.For(Subjects.Content(contentId));
+        if (!Includes(Value(context, Stages), content.Stage)) return WaitOn(context, Subjects.Content(contentId));
 
         context.Set(Stage, content.Stage);
         return WaitStep.Done(Reached);
@@ -119,7 +105,7 @@ public sealed class WaitForStage : NewsroomActivity
 [Activity("SoftSquare.Newsroom", "Newsroom",
     "Waits for the content to reach a stage by a deadline; when it does not, tells the shift's lead, or else the unit's manager.",
     DisplayName = "Deadline")]
-[FlowNode(Met, Escalated)]
+[FlowNode(Met, Escalated, ProjectEnded)]
 public sealed class Deadline : NewsroomActivity
 {
     public const string Met = "Met";
@@ -140,22 +126,15 @@ public sealed class Deadline : NewsroomActivity
 
     protected override async Task<WaitStep> StepAsync(ActivityExecutionContext context, CancellationToken ct)
     {
-        const string DueProperty = "due";
-        var contentId = RequiredId(context, ContentId, nameof(ContentId));
-        if (context.GetProperty<string>(DueProperty) is not { } stored)
-        {
-            var computed = Value(context, Due) ?? (Value(context, DueIn) is { } within
-                ? Now(context) + within
-                : throw new InvalidOperationException("The activity needs Due or DueIn."));
-            stored = computed.ToString("O", CultureInfo.InvariantCulture);
-            context.SetProperty(DueProperty, stored);
-        }
-
-        var due = DateTimeOffset.Parse(stored, CultureInfo.InvariantCulture);
+        var contentId = RequiredContent(context, ContentId);
+        var due = KeptTime(context, "due", () => Value(context, Due) ?? (Value(context, DueIn) is { } within
+            ? Now(context) + within
+            : throw new InvalidOperationException("The activity needs Due or DueIn.")));
+        if (await ProjectEndAsync(context, ct) is { } end) return end;
         var content = await context.GetRequiredService<ContentModuleApi>().ContentAsync(contentId, ct)
             ?? throw new PlatformUnavailableException($"Content does not serve content {contentId}.");
         if (WaitForStage.Includes(Value(context, Stages), content.Stage)) return WaitStep.Done(Met);
-        if (Now(context) < due) return WaitStep.For(Subjects.Content(contentId)).Until(due);
+        if (Now(context) < due) return WaitOn(context, Subjects.Content(contentId)).Until(due);
 
         var unitId = content.UnitId ?? RememberedUnit(context);
         context.Set(EscalatedTo, await EscalateAsync(context, unitId, new
@@ -204,34 +183,63 @@ public sealed class Deadline : NewsroomActivity
 }
 
 [Activity("SoftSquare.Newsroom", "Newsroom",
-    "Sends the project to the desk and waits until the desk approves the post or returns it.", DisplayName = "Desk review")]
-[FlowNode(Approved, Returned)]
+    "Sends the project to the desk and waits until the desk approves the post or returns it. A review whose shift ended goes back to the queue.",
+    DisplayName = "Desk review")]
+[FlowNode(Approved, Returned, Refiled)]
 public sealed class DeskReview : NewsroomActivity
 {
     public const string Approved = "Approved";
     public const string Returned = "Returned";
+    public const string Refiled = "Refiled";
     private const string ReturnedVersion = "returnedVersion";
 
     public Input<string?> ProjectId { get; set; } = default!;
     public Input<string?> PostId { get; set; } = default!;
 
+    /// <summary>
+    /// The shift role that reviews. When set, the activity accepts a submission and assigns a reviewer after
+    /// <see cref="ReviewerDelay"/>; Content lets the workflow do that only where the workflow owns assignment
+    /// (<c>Content:Newsroom:WorkflowOwnsAssignment</c>). When not set, people or the coordinator assign.
+    /// </summary>
+    public Input<string?> ReviewerRoleKey { get; set; } = default!;
+
+    /// <summary>How long a manager has to accept and assign by hand first.</summary>
+    public Input<TimeSpan?> ReviewerDelay { get; set; } = default!;
+
+    /// <summary>Ends with <see cref="Refiled"/> when the post's filing must be checked again.</summary>
+    public Input<bool?> EndOnRefiling { get; set; } = default!;
+
     protected override async Task<WaitStep> StepAsync(ActivityExecutionContext context, CancellationToken ct)
     {
         var projects = context.GetRequiredService<INewsRoomProjects>();
+        var content = context.GetRequiredService<ContentModuleApi>();
         var projectId = RequiredProject(context, ProjectId);
         var postId = RequiredPost(context, PostId);
         var wait = WaitStep.For(Subjects.Project(projectId), Subjects.Post(postId));
 
-        var post = await context.GetRequiredService<ContentModuleApi>().PostAsync(postId, ct)
+        var post = await content.PostAsync(postId, ct)
             ?? throw new PlatformUnavailableException($"Content does not serve post {postId}.");
-        if (post.State is "Approved" or "Scheduled" or "Published") return WaitStep.Done(Approved);
+
+        // A version whose publication was refused has to change before it counts as approved again.
+        var refused = int.TryParse(Remembered(context, PublishPost.RefusedVersion), out var refusedVersion) ? refusedVersion : -1;
+        if (post.State is "Scheduled" or "Published" || (post.State == "Approved" && post.Version > refused))
+            return WaitStep.Done(Approved);
 
         var project = await ProjectAsync(context, projectId, ct);
+        if (IsEnded(project)) return wait; // a kill cancels the workflow; a publication shows on the post
+
+        if (Value(context, EndOnRefiling) == true)
+        {
+            if (ProjectStates.Is(project.State, ProjectStates.NeedsModeration)) return wait;
+            if (Filing.Changed(Remembered(context, Filing.Property), ApprovalOf(context, project), project, post))
+                return WaitStep.Done(Refiled);
+        }
 
         // Content keeps the post "Returned" until it is submitted again: a version newer than the one acted on before.
         var actedOn = int.TryParse(Remembered(context, ReturnedVersion), out var version) ? version : -1;
-        if (post.State == "Returned" && post.Version > actedOn)
+        if (post.State == "Returned")
         {
+            if (post.Version <= actedOn) return wait;
             if (ProjectStates.Is(project.State, ProjectStates.ReadyForDesk) &&
                 !await projects.SetStateAsync(projectId, ProjectStates.InProduction, ApprovalOf(context, project), null, ct))
                 return wait.Until(Soon(context));
@@ -244,7 +252,58 @@ public sealed class DeskReview : NewsroomActivity
             !await projects.SetStateAsync(projectId, ProjectStates.ReadyForDesk, ApprovalOf(context, project), null, ct))
             return wait.Until(Soon(context));
 
-        return wait;
+        return await DeskWorkAsync(context, post, wait, ct);
+    }
+
+    /// <summary>Moves the review between the people of the unit's shifts, while the desk has not decided.</summary>
+    private async Task<WaitStep> DeskWorkAsync(
+        ActivityExecutionContext context, PostSnapshot post, WaitStep wait, CancellationToken ct)
+    {
+        var content = context.GetRequiredService<ContentModuleApi>();
+        var shifts = context.GetRequiredService<ShiftsModuleApi>();
+        var unit = post.UnitId ?? RememberedUnit(context);
+        var watch = unit is { } known ? wait with { Watch = [.. wait.Watch!, Subjects.Unit(known)] } : wait;
+
+        if (post.State == "InReview")
+        {
+            // Handover: the reviewer's shift ended, so the review goes back to the queue for the next one.
+            if (!int.TryParse(post.AssignedShiftId, NumberStyles.Integer, CultureInfo.InvariantCulture, out var held) ||
+                !await shifts.HasEndedAsync(held, ct)) return watch;
+
+            var transferred = await content.TransferAsync(post.Id, post.Version, post.AssignedShiftId!, ct);
+            if (!transferred.IsSuccess) Log(context).LogRefusedDeskStep("transfer", post.Id, (int)transferred.Status, transferred.Reason());
+            return watch.Until(Soon(context));
+        }
+
+        if (post.State is not ("Submitted" or "Accepted") || unit is not { } deskUnit ||
+            Value(context, ReviewerRoleKey) is not { Length: > 0 } role) return watch;
+
+        var after = KeptTime(context, "reviewAfter:" + post.Version.ToString(CultureInfo.InvariantCulture),
+            () => Now(context) + (Value(context, ReviewerDelay) ?? TimeSpan.Zero));
+        if (Now(context) < after) return watch.Until(after);
+
+        var running = await shifts.RunningAsync(deskUnit, ct);
+        if (await ShiftPicker.LeastLoadedAsync(context, running, role, post.OwnerId, ct) is not { } reviewer)
+            return watch.Until(Soon(context));
+
+        var shiftId = reviewer.ShiftId.ToString(CultureInfo.InvariantCulture);
+        var accepting = post.State == "Submitted";
+        var answer = accepting
+            ? await content.AcceptAsync(post.Id, post.Version, shiftId, ct)
+            : await content.AssignPostAsync(post.Id, post.Version, reviewer.UserId, shiftId, ct);
+        if (!answer.IsSuccess)
+            Log(context).LogRefusedDeskStep(accepting ? "accept" : "assign", post.Id, (int)answer.Status, answer.Reason());
+
+        // After an accept, assign at once: the next look is soon anyway, and the delay was the manager's.
+        if (accepting && answer.IsSuccess &&
+            await content.PostAsync(post.Id, ct) is { State: "Accepted" } accepted)
+        {
+            var assigned = await content.AssignPostAsync(accepted.Id, accepted.Version, reviewer.UserId, shiftId, ct);
+            if (!assigned.IsSuccess)
+                Log(context).LogRefusedDeskStep("assign", post.Id, (int)assigned.Status, assigned.Reason());
+        }
+
+        return watch.Until(Soon(context));
     }
 }
 
@@ -254,6 +313,7 @@ public sealed class PublishPost : NewsroomActivity
 {
     public const string Published = "Published";
     public const string Refused = "Refused";
+    internal const string RefusedVersion = "refusedVersion";
 
     public Input<string?> ProjectId { get; set; } = default!;
     public Input<string?> PostId { get; set; } = default!;
@@ -281,7 +341,20 @@ public sealed class PublishPost : NewsroomActivity
         if (ProjectStates.Is(project.State, ProjectStates.Killed) ||
             ProjectStates.Is(project.State, ProjectStates.NeedsModeration)) return wait;
 
-        if (post.State == "Scheduled") return await ScheduledAsync(post.ScheduledFor);
+        if (post.State == "Scheduled")
+        {
+            // Content publishes a due post only when asked to.
+            if (post.ScheduledFor is { } dueAt && dueAt <= Now(context))
+            {
+                await ReportAsync(ProjectStates.Scheduled);
+                var published = await content.PublishDueAsync(ct);
+                if (!published.IsSuccess)
+                    Log(context).LogRefusedDeskStep("publish-due", postId, (int)published.Status, published.Reason());
+                return wait.Until(Soon(context));
+            }
+
+            return await ScheduledAsync(post.ScheduledFor);
+        }
 
         var publishAt = Value(context, PublishAt);
         var later = publishAt > Now(context);
@@ -300,13 +373,13 @@ public sealed class PublishPost : NewsroomActivity
             return wait.Until(Soon(context));
 
         context.Set(Reason, answer.Reason());
+        Remember(context, RefusedVersion, post.Version.ToString(CultureInfo.InvariantCulture));
         return WaitStep.Done(Refused);
 
         async Task<WaitStep> ScheduledAsync(DateTimeOffset? at)
         {
             await ReportAsync(ProjectStates.Scheduled);
-            // Content publishes it; look shortly after the time it should.
-            return at is { } time && time > Now(context) ? wait.Until(time.AddSeconds(30)) : wait.Until(Soon(context));
+            return at is { } time && time > Now(context) ? wait.Until(time) : wait.Until(Soon(context));
         }
 
         // NewsRoom follows Content's own events too, so a refused report is nothing to wait for.
@@ -329,6 +402,9 @@ public sealed class Notify : NewsroomActivity
 
     public Input<string?> UserId { get; set; } = default!;
 
+    /// <summary>Sends to the person who proposed the workflow's project, when no <see cref="UserId"/> is set.</summary>
+    public Input<bool?> ToProjectAuthor { get; set; } = default!;
+
     /// <summary>The unit's path; used when no person is set.</summary>
     public Input<string?> UnitPath { get; set; } = default!;
 
@@ -339,8 +415,10 @@ public sealed class Notify : NewsroomActivity
     {
         var user = Value(context, UserId);
         var unit = Value(context, UnitPath);
+        if (string.IsNullOrWhiteSpace(user) && Value(context, ToProjectAuthor) == true && RunningProject(context) is { } id)
+            user = (await ProjectAsync(context, id, ct)).ProposalAuthorId;
         if (string.IsNullOrWhiteSpace(user) && string.IsNullOrWhiteSpace(unit))
-            throw new InvalidOperationException("The activity needs a UserId or a UnitPath.");
+            throw new InvalidOperationException("The activity needs a UserId, ToProjectAuthor or a UnitPath.");
 
         var type = Value(context, NotificationType) is { Length: > 0 } given ? given : DefaultType;
         var payload = JsonSerializer.SerializeToElement(new

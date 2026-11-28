@@ -148,8 +148,10 @@ var workflow = AddPool("workflow", WorkflowPort)
     .WithEnvironment("Elsa__IdentityAuthority", Issuer)
     .WithEnvironment("Elsa__PlatformApiBaseUrl", GatewayUrl)
     .WithEnvironment("Modules__Settings__elsa__Elsa__PollInterval", "00:00:10")
-    // The definition that runs every approved project here. check.ps1 publishes a temporary one under this id.
-    .WithEnvironment("Modules__Settings__elsa__Elsa__Newsroom__ProjectWorkflow", "playground-newsroom-project")
+    // The role that produces contents (check-newsroom.ps1 puts its writer on shift with it), and a short delay for
+    // a manager to assign by hand first.
+    .WithEnvironment("Modules__Settings__elsa__Elsa__Newsroom__ContentRole", "lead-editor")
+    .WithEnvironment("Modules__Settings__elsa__Elsa__Newsroom__ManagerDelay", "00:00:02")
     // One pool at a time creates the platform's shared tables and the dev tenants.
     .WaitFor(core);
 

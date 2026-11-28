@@ -23,6 +23,7 @@ public class ElsaWorkflowPermissions
     [InlineData("GET", "/elsa/api/resume/abc", "workflow.run")]
     [InlineData("POST", "/elsa/api/tasks/abc/complete", "workflow.run")]
     [InlineData("GET", "/workflows/anything", "workflow.run")]
+    [InlineData("POST", "/newsroom/dry-run", "workflow.design")]
     public void A_request_needs_the_permission_of_what_it_does(string method, string path, string permission) =>
         ElsaWorkflowPermissionMiddleware.RequiredPermission(method, new PathString(path)).ShouldBe(permission);
 

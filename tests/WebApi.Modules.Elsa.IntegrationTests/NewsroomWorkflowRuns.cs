@@ -6,6 +6,7 @@ using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Platform;
 
 namespace soft.square.net.WebApi.Modules.Elsa.IntegrationTests;
 
+[Collection(EngineTests.Collection)]
 public class NewsroomWorkflowRuns(PostgresServer server) : IAsyncLifetime
 {
     private readonly FakePlatform _platform = new();
@@ -124,15 +125,17 @@ public class NewsroomWorkflowRuns(PostgresServer server) : IAsyncLifetime
         await first.PublishAsync(Tenants.A, Steps(WaitForAccepted()));
         await first.ApproveAsync(Tenants.A, _project);
         await Task.Delay(TimeSpan.FromSeconds(3), Ct); // past the second look
-        var signal = (await first.BookmarksAsync(Tenants.A)).Single(b => b.Name == "Newsroom.Signal");
+        // One for the content, one for the project: the workflow ends a wait whose project ended.
+        var signals = (await first.BookmarksAsync(Tenants.A)).Where(b => b.Name == "Newsroom.Signal").Select(b => b.Id).Order().ToArray();
+        signals.Length.ShouldBe(2);
         var looks = _platform.Count($"/contents/{_contentId:D}");
 
         await ContentChangedAsync(second); // nothing is accepted yet
 
         _platform.Count($"/contents/{_contentId:D}").ShouldBe(looks + 1);
         var bookmarks = await first.BookmarksAsync(Tenants.A);
-        bookmarks.Single(b => b.Name == "Newsroom.Signal").Id.ShouldBe(signal.Id);
-        bookmarks.Count.ShouldBe(2); // that one, and one timer
+        bookmarks.Where(b => b.Name == "Newsroom.Signal").Select(b => b.Id).Order().ShouldBe(signals);
+        bookmarks.Count.ShouldBe(3); // that one, the project's, and one timer
 
         _platform.Change(() => Content.Stage = "accepted");
         await Task.WhenAll(ContentChangedAsync(first), ContentChangedAsync(second));
@@ -233,7 +236,6 @@ public class NewsroomWorkflowRuns(PostgresServer server) : IAsyncLifetime
         await replica.PublishAsync(Tenants.A, Steps(WaitForAccepted()));
         _platform.Change(() => Content.Stage = "accepted");
         _platform.Down = true;
-        _platform.Projects.Remove(_project.Id);
 
         // With NewsRoom down the start itself fails, and the host delivers the event again.
         await Should.ThrowAsync<PlatformUnavailableException>(() => replica.ApproveAsync(Tenants.A, _project));
@@ -273,8 +275,7 @@ public class NewsroomWorkflowRuns(PostgresServer server) : IAsyncLifetime
         _project.State.ShouldBe(ProjectStates.NeedsModeration);
 
         _platform.Change(() => { _project.State = ProjectStates.Approved; _project.ApprovalNumber = 2; });
-        await replica.DeliverAsync(Tenants.A, "newsroom.project-reapproved.v1", $"project:{_project.Id:D}",
-            new { projectId = _project.Id });
+        await replica.ApproveAsync(Tenants.A, _project, "newsroom.project-reapproved.v1");
 
         await Replica.UntilAsync(() => _project.State == ProjectStates.InProduction, "the project in production");
         _platform.Posts[42].UnitId.ShouldBe(_section);
@@ -306,10 +307,10 @@ public class NewsroomWorkflowRuns(PostgresServer server) : IAsyncLifetime
     {
         var replica = await ReplicaAsync();
         await replica.PublishAsync(Tenants.A, Steps(
-            new RouteToUnit { ContentKind = new("video"), Rules = new Input<ICollection<RoutingRuleInput>>(
-                new List<RoutingRuleInput> { new("video", _section) }) },
+            new RouteToUnit { ContentKind = new("video") },
             new EnsurePostInUnitCategories(), new DeskReview(), new PublishPost(),
             new Notify { UserId = new("author"), Message = new("It is out.") }));
+        _platform.Routes["video"] = _section;
         await replica.ApproveAsync(Tenants.A, _project);
         await Replica.UntilAsync(() => _project.State == ProjectStates.ReadyForDesk, "the project at the desk");
         _platform.Count("/publish").ShouldBe(0);
