@@ -235,6 +235,20 @@ Earlier versions ran a poller next to the workflows. Its jobs are now:
 | returning the unfinished reviews of ended shifts | Content, by itself, after its grace |
 | assigning reviewers of accepted posts, after each Section's delay | `DeskReview` for NewsRoom posts, with one delay ([Who assigns](#who-assigns)); people for the others |
 
+**Order.** Grant `shifts.view` ([Grants](#grants)), upgrade Content, then upgrade Elsa in the same window. The old
+poller reads Content's removed `/automation/accepted` first and gives up on its `404`, so against the new Content it
+should do none of its jobs, publishing included (read from its code, not run).
+
+**Posts that are already scheduled.** The new Content publishes at the due time under the URL prefix it saves when a
+post is scheduled. Posts scheduled before its upgrade have none, and stay `Scheduled`:
+
+1. Before upgrading, list the scheduled posts of every tenant.
+2. After upgrading Content, publish each one now or schedule it again; or, once all of them are due, call
+   `POST /api/content/posts/publish-due` once, with tenant-wide `content.publish` and `dynamicfields.read`.
+3. Check Content's log for `will NOT be published automatically`.
+
+Content's E3 deploy notes say how to list them.
+
 **Workflows that are waiting go on.** The default workflows' definitions did not change (`newsroom-post` and
 `newsroom-content` stay at version 1, so there is no new class): what changed is what two activities do while they wait,
 and instances resume on the new code. A `PublishPost` waiting on a scheduled post no longer asks Content to publish it.
