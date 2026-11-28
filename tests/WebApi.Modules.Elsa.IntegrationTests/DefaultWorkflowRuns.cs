@@ -295,7 +295,7 @@ public class DefaultWorkflowRuns(PostgresServer server) : IAsyncLifetime
     }
 
     [Fact]
-    public async Task AReviewerIsAssignedAndTheReviewMovesToTheNextShift()
+    public async Task AReviewerIsAssignedAndAgainWhenContentReturnsTheReview()
     {
         var replica = await ReplicaAsync(new()
         {
@@ -322,7 +322,7 @@ public class DefaultWorkflowRuns(PostgresServer server) : IAsyncLifetime
         await PostChangedAsync(replica);
 
         await Replica.UntilAsync(() => Post.State == "InReview", "the review assigned");
-        (Post.ReviewerId, Post.AssignedShiftId).ShouldBe((Editor, "7"));
+        Post.ReviewerId.ShouldBe(Editor);
 
         _platform.Change(() =>
         {
@@ -333,10 +333,17 @@ public class DefaultWorkflowRuns(PostgresServer server) : IAsyncLifetime
             });
         });
         await ShiftEndedAsync(replica, _section);
+        await Task.Delay(TimeSpan.FromSeconds(2), Ct);
 
-        await Replica.UntilAsync(() => Post.ReviewerId == "erik", "the review handed over");
-        Post.AssignedShiftId.ShouldBe("8");
-        _platform.Count("POST /api/content/posts/42/transfer").ShouldBe(1);
+        // The handover is Content's: the workflow leaves the review where it is.
+        (Post.State, Post.ReviewerId).ShouldBe(("InReview", Editor));
+        _platform.Count("transfer").ShouldBe(0);
+
+        _platform.Change(() => { Post.State = "Accepted"; Post.ReviewerId = null; Post.Version++; });
+        await PostChangedAsync(replica);
+
+        await Replica.UntilAsync(() => Post.ReviewerId == "erik", "the review assigned to the next shift");
+        _platform.Count("POST /api/content/posts/42/assign").ShouldBe(2);
     }
 
     [Fact]
@@ -358,9 +365,60 @@ public class DefaultWorkflowRuns(PostgresServer server) : IAsyncLifetime
         _platform.Count("publish-due").ShouldBe(0);
 
         await EndsAsync(replica, MainId, WorkflowSubStatus.Finished, seconds: 20);
-        _platform.Count("POST /api/content/posts/publish-due").ShouldBeGreaterThanOrEqualTo(1);
+        _platform.Count("publish-due").ShouldBe(0); // Content publishes it, unasked
         _project.State.ShouldBe(ProjectStates.Published);
         _platform.Count("POST /api/content/posts/42/publish").ShouldBe(0);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)] // the post changes between the read and the call: the event is delivered again
+    public async Task KillingAScheduledProjectUnschedulesItsPost(int conflicts)
+    {
+        var replica = await ReplicaAsync();
+        await replica.PublishAsync(Tenants.A, new Sequence
+        {
+            Activities = { new PublishPost { PublishAt = new Input<DateTimeOffset?>(DateTimeOffset.UtcNow.AddHours(1)) } }
+        });
+        _platform.PostBinding = "project-workflow";
+        SetPost("Approved");
+        _project.State = ProjectStates.ReadyForDesk;
+        await replica.ApproveAsync(Tenants.A, _project);
+        await Replica.UntilAsync(() => _project.State == ProjectStates.Scheduled, "the project scheduled");
+
+        _platform.Change(() => { _project.State = ProjectStates.Killed; _platform.UnscheduleConflicts = conflicts; });
+        var killed = new { projectId = _project.Id, state = "Killed" };
+        Task Kill() => replica.DeliverAsync(Tenants.A, "newsroom.project-state-changed.v1", $"project:{_project.Id:D}", killed);
+        if (conflicts > 0)
+        {
+            await Should.ThrowAsync<PlatformUnavailableException>(Kill);
+            Post.State.ShouldBe("Scheduled");
+        }
+
+        await Kill();
+        await Kill();
+
+        await EndsAsync(replica, MainId, WorkflowSubStatus.Cancelled, seconds: 5);
+        (Post.State, Post.ScheduledFor).ShouldBe(("Approved", (DateTimeOffset?)null));
+        _platform.Count("POST /api/content/posts/42/unschedule").ShouldBe(conflicts + 1);
+    }
+
+    [Fact]
+    public async Task AKilledProjectWithoutAWorkflowIsUnscheduledToo()
+    {
+        var replica = await ReplicaAsync();
+        _platform.PostBinding = null;
+        SetPost("Scheduled");
+        _platform.Change(() =>
+        {
+            Post.ScheduledFor = DateTimeOffset.UtcNow.AddHours(1); // scheduled by hand
+            _project.State = ProjectStates.Killed;
+        });
+
+        await replica.DeliverAsync(Tenants.A, "newsroom.project-state-changed.v1", $"project:{_project.Id:D}",
+            new { projectId = _project.Id, state = "Killed" });
+
+        Post.State.ShouldBe("Approved");
     }
 
     [Fact]

@@ -23,8 +23,6 @@ public sealed class ElsaModule : IRuntimeModule, IModulePipeline
         {
             ["Elsa:Schema"] = "elsa",
             ["Elsa:RunMigrations"] = "true",
-            ["Elsa:PollInterval"] = "00:00:15",
-            ["Elsa:HandoverLookback"] = "1.00:00:00", // days.hours: "24:00:00" would mean 24 days
             ["Elsa:Newsroom:RecheckInterval"] = "00:05:00", // a waiting activity looks again at least this often
             ["Elsa:Newsroom:SettleDelay"] = "00:00:02",
             ["Elsa:Newsroom:RetryDelay"] = "00:00:30",
@@ -49,7 +47,7 @@ public sealed class ElsaModule : IRuntimeModule, IModulePipeline
         services.AddSingleton(settings);
         services.AddSingleton(provider => new ElsaEngine(provider, settings));
         services.AddSingleton<ITenantInitializer, ElsaTenantInitializer>();
-        services.AddHostedService<ElsaEngineService>(); // first: the coordinator starts after the engine
+        services.AddHostedService<ElsaEngineService>(); // first: the sweeper starts after the engine
         services.AddHostedService<TimerSweeperService>();
 
         // The events that start and resume workflows, with their inbox in each tenant's database.
@@ -58,9 +56,6 @@ public sealed class ElsaModule : IRuntimeModule, IModulePipeline
         services.AddIntegrationEvents<WorkflowEventsDbContext>(options => options.Source = "elsa");
         foreach (var pattern in NewsroomEventTypes.Subscriptions)
             services.AddIntegrationHandler<NewsroomEventHandler>(pattern);
-
-        services.AddHttpClient<NewsroomAutomationClient>();
-        services.AddHostedService<NewsroomAutomationService>();
     }
 
     public void ConfigurePipeline(IApplicationBuilder app)

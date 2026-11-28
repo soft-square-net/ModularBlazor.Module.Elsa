@@ -26,7 +26,6 @@ internal sealed class FakePost
     public Guid? UnitId { get; set; }
     public string OwnerId { get; set; } = "author";
     public string PostKind { get; set; } = "post.news";
-    public string? AssignedShiftId { get; set; }
     public string? ReviewerId { get; set; }
     public DateTimeOffset? ScheduledFor { get; set; }
 
@@ -85,6 +84,9 @@ internal sealed class FakePlatform : HttpMessageHandler
     public volatile bool Down;
     public string? PublishRefusal;
 
+    /// <summary>How many unschedule calls find the post changed since it was read.</summary>
+    public int UnscheduleConflicts;
+
     public int Count(string text) => Calls.Count(c => c.Contains(text, StringComparison.Ordinal));
 
     public void Change(Action change)
@@ -105,7 +107,21 @@ internal sealed class FakePlatform : HttpMessageHandler
         var query = request.RequestUri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries)
             .Select(pair => pair.Split('=', 2))
             .ToDictionary(pair => pair[0], pair => Uri.UnescapeDataString(pair.Length > 1 ? pair[1] : ""));
-        lock (_gate) return Answer(request.Method.Method, path.Trim('/').Split('/'), query, body);
+        lock (_gate)
+        {
+            PublishDuePosts();
+            return Answer(request.Method.Method, path.Trim('/').Split('/'), query, body);
+        }
+    }
+
+    // Content publishes its own due posts; the fake does so before it answers.
+    private void PublishDuePosts()
+    {
+        foreach (var due in Posts.Values.Where(p => p.State == "Scheduled" && p.ScheduledFor <= DateTimeOffset.UtcNow))
+        {
+            due.State = "Published";
+            due.Version++;
+        }
     }
 
     private HttpResponseMessage Answer(string method, string[] s, Dictionary<string, string> query, JsonElement body)
@@ -154,15 +170,6 @@ internal sealed class FakePlatform : HttpMessageHandler
             case ("GET", ["api", "content", "posts", var id]):
                 return Posts.TryGetValue(int.Parse(id), out var post) ? Json(Snapshot(post)) : NotFound();
 
-            case ("POST", ["api", "content", "posts", "publish-due"]):
-                foreach (var due in Posts.Values.Where(p => p.State == "Scheduled" && p.ScheduledFor <= DateTimeOffset.UtcNow))
-                {
-                    due.State = "Published";
-                    due.Version++;
-                }
-
-                return Json(new { });
-
             case ("POST", ["api", "content", "posts", var id, "schedule"]):
                 return Update(id, body, target =>
                 {
@@ -171,26 +178,30 @@ internal sealed class FakePlatform : HttpMessageHandler
                 });
 
             case ("POST", ["api", "content", "posts", var id, "accept"]):
-                return Update(id, body, target =>
+                return Update(id, body, target => target.State = "Accepted");
+
+            case ("POST", ["api", "content", "posts", var id, "unschedule"]):
+            {
+                var target = Posts[int.Parse(id)];
+                if (UnscheduleConflicts > 0)
                 {
-                    target.State = "Accepted";
-                    target.AssignedShiftId = body.GetProperty("shiftId").GetString();
+                    UnscheduleConflicts--;
+                    target.Version++; // changed since it was read
+                }
+
+                if (target.State != "Scheduled") return Conflict("The post is not scheduled.");
+                return Update(id, body, scheduled =>
+                {
+                    scheduled.State = "Approved";
+                    scheduled.ScheduledFor = null;
                 });
+            }
 
             case ("POST", ["api", "content", "posts", var id, "assign"]):
                 return Update(id, body, target =>
                 {
                     target.State = "InReview";
                     target.ReviewerId = body.GetProperty("assigneeId").GetString();
-                    target.AssignedShiftId = body.GetProperty("shiftId").GetString();
-                });
-
-            case ("POST", ["api", "content", "posts", var id, "transfer"]):
-                return Update(id, body, target =>
-                {
-                    target.State = "Accepted";
-                    target.ReviewerId = null;
-                    target.AssignedShiftId = null;
                 });
 
             case ("PUT", ["api", "content", "posts", var id, "unit"]):
@@ -268,7 +279,7 @@ internal sealed class FakePlatform : HttpMessageHandler
     private object Snapshot(FakePost post) => new
     {
         post.Id, post.Version, post.State, post.Categories, post.UnitId, post.ScheduledFor, post.OwnerId,
-        post.AssignedShiftId, post.PostKind,
+        post.PostKind,
         contents = post.Attached.Select(a => new
         {
             a.ContentId, a.Required, fieldKey = Contents[a.ContentId].FieldKey, stage = Contents[a.ContentId].Stage,

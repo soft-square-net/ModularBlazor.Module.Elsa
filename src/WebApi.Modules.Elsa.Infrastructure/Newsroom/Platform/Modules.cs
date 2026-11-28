@@ -7,8 +7,7 @@ namespace soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Platform;
 
 public sealed record PostSnapshot(
     int Id, int Version, string State, IReadOnlyList<string> Categories, Guid? UnitId, DateTimeOffset? ScheduledFor,
-    string? OwnerId = null, string? AssignedShiftId = null, IReadOnlyList<PostContentSnapshot>? Contents = null,
-    string? PostKind = null);
+    string? OwnerId = null, IReadOnlyList<PostContentSnapshot>? Contents = null, string? PostKind = null);
 
 /// <summary>A content attached to a post. <paramref name="FieldKey"/> is its content kind.</summary>
 public sealed record PostContentSnapshot(Guid ContentId, bool Required, string FieldKey, string Stage, bool Archived);
@@ -49,22 +48,18 @@ internal sealed class ContentModuleApi(PlatformApi api)
     public Task<PlatformAnswer> AcceptAsync(int id, int version, string shiftId, CancellationToken ct) =>
         api.SendAsync(HttpMethod.Post, $"/api/content/posts/{id}/accept", new { version, shiftId }, ct);
 
-    public Task<PlatformAnswer> AssignPostAsync(int id, int version, string assigneeId, string shiftId, CancellationToken ct) =>
-        api.SendAsync(HttpMethod.Post, $"/api/content/posts/{id}/assign", new { version, assigneeId, shiftId }, ct);
-
-    /// <summary>Handover: a review goes back to the queue.</summary>
-    public Task<PlatformAnswer> TransferAsync(int id, int version, string fromShift, CancellationToken ct) =>
-        api.SendAsync(HttpMethod.Post, $"/api/content/posts/{id}/transfer", new { version, fromShift }, ct);
-
-    /// <summary>Publishes every scheduled post of the tenant that is due.</summary>
-    public Task<PlatformAnswer> PublishDueAsync(CancellationToken ct) =>
-        api.SendAsync(HttpMethod.Post, "/api/content/posts/publish-due", null, ct);
+    public Task<PlatformAnswer> AssignPostAsync(int id, int version, string assigneeId, CancellationToken ct) =>
+        api.SendAsync(HttpMethod.Post, $"/api/content/posts/{id}/assign", new { version, assigneeId }, ct);
 
     public Task<PlatformAnswer> PublishAsync(int id, int version, CancellationToken ct) =>
         api.SendAsync(HttpMethod.Post, $"/api/content/posts/{id}/publish", new { version }, ct);
 
     public Task<PlatformAnswer> ScheduleAsync(int id, int version, DateTimeOffset publishAt, CancellationToken ct) =>
         api.SendAsync(HttpMethod.Post, $"/api/content/posts/{id}/schedule", new { version, publishAt }, ct);
+
+    /// <summary>A scheduled post becomes approved again, with no schedule.</summary>
+    public Task<PlatformAnswer> UnscheduleAsync(int id, int version, CancellationToken ct) =>
+        api.SendAsync(HttpMethod.Post, $"/api/content/posts/{id}/unschedule", new { version }, ct);
 }
 
 /// <summary>Shifts' public API (/api/shifts).</summary>

@@ -4,11 +4,13 @@
 
 ## Deployment modes
 
-- **Single process/pool:** activate `elsa`, `content`, and `shifts` in the same API pool. The Elsa hosted coordinator calls the Content and Shifts APIs through the gateway.
+- **Single process/pool:** activate `elsa`, `content`, and `shifts` in the same API pool. The newsroom workflows call the other modules' APIs through the gateway.
 - **Separated workflow pool:** run dedicated WebApi processes with `Modules:Pool=workflow`, `Modules:Role=Api`, and `Modules:Enabled=elsa`. Route `/api/elsa/**` and the Content/Shifts APIs to their owning pools. `HotUnload=false`; upgrade by rolling restart.
 - **ERP configuration:** omit Content, Shifts, and Elsa. Identity, tenancy, and unrelated modules have no project dependency on them.
 
-The modules communicate through HTTP and the host's tenant context, not project references. Content owns creative works and validates state changes; Shifts owns rota and shift timing; Elsa coordinates delayed assignment, scheduled publishing, and the handover of unfinished reviews. Shifts checks ended shifts out itself (its `ShiftClock` service); Elsa never checks a shift out. Persisted timestamps and state in Content/Shifts are authoritative, so a restarted coordinator can reconcile overdue actions. Domain endpoints recheck permissions and current state on every command.
+The modules communicate through HTTP and the host's tenant context, not project references. Content owns creative works and validates state changes; it publishes its own due posts, and returns to the queue a review whose reviewer can no longer review. Shifts owns rota and shift timing, and checks ended shifts out itself (its `ShiftClock` service); Elsa never checks a shift out. Elsa runs the [newsroom workflows](#newsroom-workflows), which assign work and reviews. State in the owning modules is authoritative, and their endpoints recheck permissions and current state on every command.
+
+Elsa needs a Content that publishes its own due posts, hands over reviews and has `POST /posts/{id}/unschedule` (Content's E3 change). Upgrade the two together.
 
 ## Setup
 
@@ -17,9 +19,41 @@ The modules communicate through HTTP and the host's tenant context, not project 
 3. Configure the `ConnectionStrings:elsa` secret for the workflow host. The host passes it only to the Elsa module; it is not stored in `modules.json`.
 4. Configure the same confidential OAuth client secret for Identity and the workflow pool. In the Aspire Hybird AppHost, supply the `elsa-client-secret` parameter from Aspire user-secrets or the deployment secret provider.
 5. Grant service subject `elsa-workflows` the [grants](#grants) below, in each tenant.
-6. Ensure replicas share the module catalog/package storage and configure the Elsa database with durable storage/backups. PostgreSQL is the provider wired by this initial module.
+6. Set up who assigns the work: see [Who assigns](#who-assigns).
+7. Ensure replicas share the module catalog/package storage and configure the Elsa database with durable storage/backups. PostgreSQL is the provider wired by this initial module.
 
-Section settings control the assignment delay (default five minutes) and checkout grace (default fifteen minutes), after which Shifts checks the shift out. Assignment delay begins when the manager accepts the submission. Editing a live creative work retains its published snapshot and cancels a pending schedule pending Desk reapproval.
+Editing a live creative work retains its published snapshot and cancels a pending schedule pending Desk reapproval.
+
+## Who assigns
+
+Turn these two on **together**, once the post kinds are bound in NewsRoom:
+
+| Setting | Value |
+|---|---|
+| Content: `Content:Newsroom:WorkflowOwnsAssignment` | `true` |
+| Elsa: `Elsa:Newsroom:ReviewerRole` | the key of the shift role that reviews, such as Shifts' own `editor`. The role must grant `content.review`: Content refuses a reviewer without it. |
+
+Content then leaves the accept, assignment, transfer and return of a NewsRoom post (and of its contents) to holders of
+`content.unit.assign`, which is meant for `elsa-workflows` alone. Posts without a NewsRoom project are assigned by hand
+as before. The workflows wait `Elsa:Newsroom:ReviewerDelay` (one delay for every Section; the Sections' own assignment
+delay is no longer read) after a submission, or after Content returns a review to the queue, then accept the post and
+assign the least loaded holder of the role checked in to a running shift of the post's unit, never the post's owner.
+
+- **Content's setting on, `ReviewerRole` empty** (the default): nobody who lacks `content.unit.assign` can give a
+  NewsRoom post a reviewer, so such posts stop at the desk.
+- **`ReviewerRole` set, Content's setting off** (Content's default): Content refuses the workflow's accept and
+  assignment, since `elsa-workflows` does not hold the manual rights. It logs a warning and tries again; people can
+  assign by hand.
+- **Both off:** people assign reviews. The activities that assign contents (**Assign in shift**, **Work in shift**,
+  so the default `newsroom-content`) then need `content.assign` granted to `elsa-workflows` as well.
+- **A NewsRoom post that no `DeskReview` with a `ReviewerRoleKey` runs for** (no binding, a workflow that ended or was
+  cancelled, or an authored definition without one) gets no reviewer from the workflows.
+
+Reviewers approve with their own rights, and Content has DynamicFields check the post as them: besides the shift's
+`content.review` they need `dynamicfields.read`, or the approval answers `503`.
+
+The module's default for `ReviewerRole` stays empty, to match Content's default: role keys and the moment to switch
+belong to the deployment.
 
 ## Grants
 
@@ -27,14 +61,17 @@ Tenant-wide, for the service subject `elsa-workflows`. They are tenant-scoped an
 
 | Permission | Used for |
 |---|---|
-| `content.assign`, `content.transfer`, `content.publish` | the coordinator; **Assign in shift**, **Work in shift**, **Desk review** (handover of a review) and **Publish post** (also `publish-due`) |
-| `shifts.manage` | the coordinator (`GET /api/shifts/overdue` and the ended list) |
-| `content.unit.assign` | filing a post in its Section and a content in its unit; it is also what lets the service see posts |
+| `content.unit.assign` | filing a post in its Section and a content in its unit; assigning contents, and accepting and assigning posts, where [Content's workflow owns assignment](#who-assigns); it is also what lets the service see posts |
+| `content.publish` | **Publish post** (publish and schedule), and unscheduling the post of a killed project |
+| `shifts.view` | the running shifts and their rotas |
 | `newsroom.workflow` | reading projects and reporting their states; bindings, routing and workload |
 | `org.read` | Organization's members of a unit, to find its managers when a deadline passes and no lead is on shift |
 | `dynamicfields.read` | Content's publish has DynamicFields check the post as the caller; without it publishing answers `503` |
 
 A missing grant does not fault a newsroom workflow: the activity logs a warning, tries again, and goes on once the grant is there.
+
+Earlier versions also needed `content.assign`, `content.transfer` and `shifts.manage`: revoke them after the upgrade.
+Keep `content.assign` only where Content's workflow does not own assignment (see [Who assigns](#who-assigns)).
 
 ## Newsroom workflows
 
@@ -48,7 +85,7 @@ The module subscribes to these integration events through the platform's inbox (
 |---|---|
 | `newsroom.project-approved.v1`, `newsroom.project-binding-available.v1` | starts the bound workflow, one instance per tenant and project |
 | `newsroom.project-reapproved.v1` | starts it if the project has none, else wakes the waits |
-| `newsroom.project-state-changed.v1` with `Killed` | cancels the project's workflows, sub-workflows included |
+| `newsroom.project-state-changed.v1` with `Killed` | cancels the project's workflows, sub-workflows included, then [unschedules its post](#scheduled-publishing) |
 | other project state changes, `content.work-item-*`, `content.post-*`, `shifts.checked-in.v1`, `shifts.checked-out.v1`, `shifts.handover.v1`, `shifts.ended.v1`, `shifts.published.v1`, `shifts.member-added.v1` | tells the activities that wait on that project, content, post or unit to look again |
 
 The event records are copied from `NewsRoom.Contracts`; the module references no NewsRoom package.
@@ -129,25 +166,26 @@ Their type names in a definition are `SoftSquare.Newsroom.<name>`.
   unit or of the nearest unit above it, else to the unit.
 - **A project that is published**, in the workflow or by hand (NewsRoom follows Content), ends the waits above with
   `ProjectEnded`. In a `Sequence` the workflow then goes on; in a flowchart, leave the outcome unconnected to end there.
-- **Killing** a project cancels its instances. Until the kill's event arrives, their waits do nothing. It does not cancel
-  a publication already scheduled in Content, which has no call for that.
+- **Killing** a project cancels its instances. Until the kill's event arrives, their waits do nothing.
 
 ### Handover in a workflow
 
 - **Content.** `WorkInShift` remembers the shift in which the assignee holds the work. When that shift has ended, it
   assigns the content to the least loaded holder of the role on a running shift, unless the assignee goes on in one.
   Someone it never saw on a shift of the unit was assigned by hand and keeps the work.
-- **Reviews.** When the shift of a post in review has ended, `DeskReview` returns the review to the queue (Content's
-  transfer).
-- **New reviewers.** Only with `ReviewerRoleKey` (`Elsa:Newsroom:ReviewerRole` in the default workflow) does the
-  workflow accept a submission and assign a reviewer, never the post's owner, after `ReviewerDelay`. Content allows the
-  service to do that only with `Content:Newsroom:WorkflowOwnsAssignment`; without it, leave the setting empty and people
-  or the coordinator assign.
+- **Reviews** are Content's to hand over: it returns to the queue a review whose reviewer has had no right to review
+  the post for `Content:Newsroom:ReviewHandoverGrace`. A `DeskReview` with a reviewer role then assigns it again, after
+  `ReviewerDelay`.
+- **New reviewers:** see [Who assigns](#who-assigns).
 
 ### Scheduled publishing
 
-`PublishPost` with `PublishAt` schedules the post. Content publishes a due post only when asked, so at that time the
-activity calls `publish-due`, which publishes every due post of the tenant.
+`PublishPost` with `PublishAt` schedules the post and waits. Content publishes it when it is due; Elsa does not ask it to.
+
+When a project is killed, Elsa reads its post and, if it is scheduled (by a workflow or by hand, with or without a
+workflow), takes the schedule back. If Content does not take the call, the kill's event fails and the host delivers it
+again; a delivery that is given up on, or a post that falls due before the call gets through, leaves the post to be
+published.
 
 ### Dry run
 
@@ -174,7 +212,7 @@ post's kind there. The answer has the definition, its steps in order (`activityI
 |---|---|
 | `Elsa:Newsroom:ContentRole` (the shift role that produces contents, in `newsroom-content`) | `writer` |
 | `Elsa:Newsroom:ManagerDelay` (to assign a content by hand first) | `00:05:00` |
-| `Elsa:Newsroom:ReviewerRole` (see [Handover](#handover-in-a-workflow)) | empty |
+| `Elsa:Newsroom:ReviewerRole` (see [Who assigns](#who-assigns)) | empty |
 | `Elsa:Newsroom:ReviewerDelay` | `00:05:00` |
 | `Elsa:Newsroom:RecheckInterval` | `00:05:00` |
 | `Elsa:Newsroom:SettleDelay` (the extra look right after a wait begins) | `00:00:02` |
@@ -182,30 +220,39 @@ post's kind there. The answer has the definition, its steps in order (`activityI
 | `Elsa:Newsroom:TimerSweepInterval` | `00:01:00` |
 | `Elsa:Newsroom:TimerSweepGrace` (how overdue a timer is before the sweep takes it) | `00:00:30` |
 
-`Elsa:Newsroom:ProjectWorkflow` no longer exists: bind post kinds in NewsRoom instead. Workflows that an earlier version
+`Elsa:PollInterval` and `Elsa:HandoverLookback` no longer exist: the coordinator that read them is gone (see
+[Upgrading from the coordinator](#upgrading-from-the-coordinator)). `Elsa:Newsroom:ProjectWorkflow` no longer exists: bind post kinds in NewsRoom instead. Workflows that an earlier version
 left suspended go on after the upgrade. A `Rules` input of `RouteToUnit` in a saved definition is ignored: the rules are
 NewsRoom's now.
 
-## Shift handover
+## Upgrading from the coordinator
 
-For every shift that ended (checked out by a person or by `ShiftClock`), Elsa calls Content's handover, which returns the shift's unfinished review work to the queue.
+Earlier versions ran a poller next to the workflows. Its jobs are now:
 
-- **Where it reads.** `GET /api/shifts/shifts/ended?since={utc}&take=500` (`shifts.manage`), oldest end first.
-- **Cursor.** One per tenant, **in memory**: the newest `endedAt` seen. Each read goes back five minutes behind it, because a shift can be saved after one with a later end was read. Handled shifts are skipped by id.
-- **Failures.** Only a successful handover counts. After a failed one (any other status, `404` and `409` included), the cursor stays at that shift and the next poll retries it; the other shifts are still handed over.
-- **Restarts.** A new process looks back `Elsa:HandoverLookback` (default `1.00:00:00`, one day) and hands those shifts over again; the handover is idempotent. A shift that ended longer ago than that while Elsa was down, or whose handover was still failing at a restart, may not be retried. Write the value as `days.hours:minutes:seconds`: `24:00:00` means 24 days.
-- **Replicas** each keep their own cursor and may repeat a handover.
-- **Older Shifts.** When the ended list answers `404`, Elsa uses `GET /api/shifts/overdue` and calls the handover once the shift is past its end plus the checkout grace. That list holds only shifts not checked out yet, so a shift checked out before Elsa's next poll past the grace gets no handover there.
+| Job | Now |
+|---|---|
+| publishing due posts | Content, by itself |
+| returning the unfinished reviews of ended shifts | Content, by itself, after its grace |
+| assigning reviewers of accepted posts, after each Section's delay | `DeskReview` for NewsRoom posts, with one delay ([Who assigns](#who-assigns)); people for the others |
 
-The coordinator reconciles persisted business deadlines on a configurable polling interval, and still runs next to the
-newsroom workflows. Business state transitions stay in the owning modules. The default workflows do **not** replace it
-yet. Without it, nothing would:
+**Order.** Grant `shifts.view` ([Grants](#grants)), upgrade Content, then upgrade Elsa in the same window. The old
+poller reads Content's removed `/automation/accepted` first and gives up on its `404`, so against the new Content it
+should do none of its jobs, publishing included (read from its code, not run).
 
-- publish a scheduled post that no running `PublishPost` waits for (scheduled by hand, or without a project);
-- hand over the reviews of posts that are not in a running `DeskReview` (without a project, or whose workflow ended);
-- assign reviewers of accepted posts, unless `Elsa:Newsroom:ReviewerRole` is set, and then only for posts in a running
-  `DeskReview`;
-- call Content's whole-shift handover: `DeskReview` transfers one post's review at a time.
+**Posts that are already scheduled.** The new Content publishes at the due time under the URL prefix it saves when a
+post is scheduled. Posts scheduled before its upgrade have none, and stay `Scheduled`:
+
+1. Before upgrading, list the scheduled posts of every tenant.
+2. After upgrading Content, publish each one now or schedule it again; or, once all of them are due, call
+   `POST /api/content/posts/publish-due` once, with tenant-wide `content.publish` and `dynamicfields.read`.
+3. Check Content's log for `will NOT be published automatically`.
+
+Content's E3 deploy notes say how to list them.
+
+**Workflows that are waiting go on.** The default workflows' definitions did not change (`newsroom-post` and
+`newsroom-content` stay at version 1, so there is no new class): what changed is what two activities do while they wait,
+and instances resume on the new code. A `PublishPost` waiting on a scheduled post no longer asks Content to publish it.
+A `DeskReview` no longer transfers a review whose shift ended; Content returns it, and the activity assigns it again.
 
 ## Engine hosting
 

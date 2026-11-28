@@ -183,7 +183,7 @@ public sealed class Deadline : NewsroomActivity
 }
 
 [Activity("SoftSquare.Newsroom", "Newsroom",
-    "Sends the project to the desk and waits until the desk approves the post or returns it. A review whose shift ended goes back to the queue.",
+    "Sends the project to the desk and waits until the desk approves the post or returns it. With a reviewer role, also accepts a submission and assigns its reviewer.",
     DisplayName = "Desk review")]
 [FlowNode(Approved, Returned, Refiled)]
 public sealed class DeskReview : NewsroomActivity
@@ -198,8 +198,8 @@ public sealed class DeskReview : NewsroomActivity
 
     /// <summary>
     /// The shift role that reviews. When set, the activity accepts a submission and assigns a reviewer after
-    /// <see cref="ReviewerDelay"/>; Content lets the workflow do that only where the workflow owns assignment
-    /// (<c>Content:Newsroom:WorkflowOwnsAssignment</c>). When not set, people or the coordinator assign.
+    /// <see cref="ReviewerDelay"/>, also again when Content returns a review to the queue. Set it where the workflow
+    /// owns assignment (<c>Content:Newsroom:WorkflowOwnsAssignment</c>). When not set, the activity assigns nobody.
     /// </summary>
     public Input<string?> ReviewerRoleKey { get; set; } = default!;
 
@@ -255,7 +255,10 @@ public sealed class DeskReview : NewsroomActivity
         return await DeskWorkAsync(context, post, wait, ct);
     }
 
-    /// <summary>Moves the review between the people of the unit's shifts, while the desk has not decided.</summary>
+    /// <summary>
+    /// Gives a submission to a reviewer on the unit's shift, while the desk has not decided. A review whose reviewer
+    /// can no longer review is Content's to return to the queue.
+    /// </summary>
     private async Task<WaitStep> DeskWorkAsync(
         ActivityExecutionContext context, PostSnapshot post, WaitStep wait, CancellationToken ct)
     {
@@ -263,17 +266,6 @@ public sealed class DeskReview : NewsroomActivity
         var shifts = context.GetRequiredService<ShiftsModuleApi>();
         var unit = post.UnitId ?? RememberedUnit(context);
         var watch = unit is { } known ? wait with { Watch = [.. wait.Watch!, Subjects.Unit(known)] } : wait;
-
-        if (post.State == "InReview")
-        {
-            // Handover: the reviewer's shift ended, so the review goes back to the queue for the next one.
-            if (!int.TryParse(post.AssignedShiftId, NumberStyles.Integer, CultureInfo.InvariantCulture, out var held) ||
-                !await shifts.HasEndedAsync(held, ct)) return watch;
-
-            var transferred = await content.TransferAsync(post.Id, post.Version, post.AssignedShiftId!, ct);
-            if (!transferred.IsSuccess) Log(context).LogRefusedDeskStep("transfer", post.Id, (int)transferred.Status, transferred.Reason());
-            return watch.Until(Soon(context));
-        }
 
         if (post.State is not ("Submitted" or "Accepted") || unit is not { } deskUnit ||
             Value(context, ReviewerRoleKey) is not { Length: > 0 } role) return watch;
@@ -290,7 +282,7 @@ public sealed class DeskReview : NewsroomActivity
         var accepting = post.State == "Submitted";
         var answer = accepting
             ? await content.AcceptAsync(post.Id, post.Version, shiftId, ct)
-            : await content.AssignPostAsync(post.Id, post.Version, reviewer.UserId, shiftId, ct);
+            : await content.AssignPostAsync(post.Id, post.Version, reviewer.UserId, ct);
         if (!answer.IsSuccess)
             Log(context).LogRefusedDeskStep(accepting ? "accept" : "assign", post.Id, (int)answer.Status, answer.Reason());
 
@@ -298,7 +290,7 @@ public sealed class DeskReview : NewsroomActivity
         if (accepting && answer.IsSuccess &&
             await content.PostAsync(post.Id, ct) is { State: "Accepted" } accepted)
         {
-            var assigned = await content.AssignPostAsync(accepted.Id, accepted.Version, reviewer.UserId, shiftId, ct);
+            var assigned = await content.AssignPostAsync(accepted.Id, accepted.Version, reviewer.UserId, ct);
             if (!assigned.IsSuccess)
                 Log(context).LogRefusedDeskStep("assign", post.Id, (int)assigned.Status, assigned.Reason());
         }
@@ -341,20 +333,8 @@ public sealed class PublishPost : NewsroomActivity
         if (ProjectStates.Is(project.State, ProjectStates.Killed) ||
             ProjectStates.Is(project.State, ProjectStates.NeedsModeration)) return wait;
 
-        if (post.State == "Scheduled")
-        {
-            // Content publishes a due post only when asked to.
-            if (post.ScheduledFor is { } dueAt && dueAt <= Now(context))
-            {
-                await ReportAsync(ProjectStates.Scheduled);
-                var published = await content.PublishDueAsync(ct);
-                if (!published.IsSuccess)
-                    Log(context).LogRefusedDeskStep("publish-due", postId, (int)published.Status, published.Reason());
-                return wait.Until(Soon(context));
-            }
-
-            return await ScheduledAsync(post.ScheduledFor);
-        }
+        // Content publishes its own due posts; the activity only waits to see it.
+        if (post.State == "Scheduled") return await ScheduledAsync(post.ScheduledFor);
 
         var publishAt = Value(context, PublishAt);
         var later = publishAt > Now(context);

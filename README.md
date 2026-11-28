@@ -73,8 +73,11 @@ any other playground first. Data stays in the Docker volume `elsa-playground-dat
   value. Never put a real secret in the repo. The identity service has one configurable service client, so here
   Organization and Shifts sign in with it too; a real deployment gives each its own.
 - **Grants.** The `seed-grants` resource (`playground/seed-grants.ps1`, safe to rerun) gives `elsa-workflows`, in each
-  tenant, `content.assign`, `content.transfer`, `content.publish`, `content.unit.assign`, `shifts.manage`,
-  `newsroom.workflow`, `org.read` and `dynamicfields.read` (why each: [src/README.md](src/README.md#grants)).
+  tenant, `content.unit.assign`, `content.publish`, `shifts.view`, `newsroom.workflow`, `org.read` and
+  `dynamicfields.read` (why each: [src/README.md](src/README.md#grants)). It only adds: a data volume from an earlier
+  version keeps the grants that are no longer needed.
+- **Assignment.** The workflows own it: Content's `WorkflowOwnsAssignment` is on and `ReviewerRole` is `editor`
+  ([who assigns](src/README.md#who-assigns)). Content's review-handover grace is 15 seconds here.
 - **Elsa's API** through the gateway: `http://localhost:5080/api/elsa/elsa/api/...`.
 
 ### The workflow check
@@ -102,9 +105,11 @@ Add `-PlatformRoot <path>` for a platform checkout elsewhere. It prepares a Sect
 shift and a routing rule, and approves a proposal while no workflow is bound: none starts, NewsRoom reports the setup
 error and a [dry run](src/README.md#dry-run) says why. It then binds the post kind to `newsroom-post` and checks that
 NewsRoom's event starts the [default workflows](src/README.md#default-workflows), and that the real events take the
-post from filing, through its content's sub-workflow and one return by the desk, to publication. A second project is
-killed to check that its sub-workflow is cancelled too. It plays the writer and the desk itself. It leaves its data
-behind (a central organization `elsa-playground` with a seed for `acme`, proposals, posts, shifts) and can be run again.
+post from filing, through its content's sub-workflow and one return by the desk, to publication. The workflow assigns
+the reviewer, and again after the reviewer leaves the shift and Content returns the review. A second project is killed
+to check that its sub-workflow is cancelled too. Two more, with no workflow bound, check that Content publishes a due
+post by itself and that killing a project unschedules its post. It plays the writer, the desk and the reviewer
+(`editor@modular.local`) itself. It leaves its data behind (a central organization `elsa-playground` with a seed for `acme`, proposals, posts, shifts) and can be run again.
 
 ## Branches
 
