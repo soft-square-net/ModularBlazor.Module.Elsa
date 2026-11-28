@@ -1,0 +1,50 @@
+<Project Sdk="Aspire.AppHost.Sdk/13.6.4">
+
+  <!--
+    Elsa playground: a small platform with this repo's module on its own "workflow" pool, and the modules the newsroom
+    workflows use (Organization, Shifts, DynamicFields, Content) on a "core" pool. See README.md, "Developing".
+    The platform and the other modules come from checkouts next to this repo:
+      <workspace>/Platform, <workspace>/Module.Organization, <workspace>/Module.Shifts, ...
+    For other places: -p:PlatformRoot=D:/src/Platform/ and the app host setting Playground:SiblingsRoot (or
+    Playground:Organization, Playground:Shifts, ... one by one).
+    Not in the solution on purpose: CI builds the module without those checkouts.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <UserSecretsId>modularblazor-elsa-playground</UserSecretsId>
+    <PlatformRoot Condition="'$(PlatformRoot)' == ''">$(MSBuildThisFileDirectory)..\..\Platform\</PlatformRoot>
+    <ModuleProject>..\src\WebApi.Modules.Elsa.Infrastructure\WebApi.Modules.Elsa.Infrastructure.csproj</ModuleProject>
+    <ModuleOutput>$(MSBuildThisFileDirectory)..\src\WebApi.Modules.Elsa.Infrastructure\bin\$(Configuration)\net10.0\</ModuleOutput>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Keep in step with the Aspire SDK version above (and with the platform's Hybird app host). -->
+    <PackageReference Include="Aspire.Hosting.PostgreSQL" Version="13.6.5" />
+    <PackageReference Include="Aspire.Hosting.RabbitMQ" Version="13.6.5" />
+    <PackageReference Include="Aspire.Hosting.Yarp" Version="13.6.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The platform, from source. -->
+    <ProjectReference Include="$(PlatformRoot)src\WebApi\WebApi\WebApi.csproj" />
+    <ProjectReference Include="$(PlatformRoot)src\WebApi\Identity\WebApi.Identity.Server\WebApi.Identity.Server.csproj" />
+    <ProjectReference Include="$(PlatformRoot)src\apps\blazor\ModularBlazor.BlzWebClient\ModularBlazor.BlzWebClient.csproj" />
+    <!-- The module: built before the playground starts, never referenced or run as a project (the workflow pool loads it). -->
+    <ProjectReference Include="$(ModuleProject)" IsAspireProjectResource="false" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Paths for AppHost.cs. -->
+    <AssemblyMetadata Include="ModuleOutput" Value="$([System.IO.Path]::GetFullPath('$(ModuleOutput)'))" />
+    <AssemblyMetadata Include="RepoRoot" Value="$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..'))" />
+    <AssemblyMetadata Include="PlaygroundRoot" Value="$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory).'))" />
+    <AssemblyMetadata Include="PlatformRoot" Value="$([System.IO.Path]::GetFullPath('$(PlatformRoot)'))" />
+  </ItemGroup>
+
+  <Target Name="CheckPlatformCheckout" BeforeTargets="CollectPackageReferences;Restore;Build">
+    <Error Condition="!Exists('$(PlatformRoot)src\WebApi\WebApi\WebApi.csproj')"
+           Text="No ModularBlazor.Platform checkout at '$(PlatformRoot)'. Clone https://github.com/soft-square-net/ModularBlazor.Platform next to this repo (as 'Platform'), or pass -p:PlatformRoot=&lt;path to it&gt;/." />
+  </Target>
+
+</Project>
