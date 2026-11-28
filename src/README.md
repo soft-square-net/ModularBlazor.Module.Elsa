@@ -49,6 +49,9 @@ assign the least loaded holder of the role checked in to a running shift of the 
 - **A NewsRoom post that no `DeskReview` with a `ReviewerRoleKey` runs for** (no binding, a workflow that ended or was
   cancelled, or an authored definition without one) gets no reviewer from the workflows.
 
+Reviewers approve with their own rights, and Content has DynamicFields check the post as them: besides the shift's
+`content.review` they need `dynamicfields.read`, or the approval answers `503`.
+
 The module's default for `ReviewerRole` stays empty, to match Content's default: role keys and the moment to switch
 belong to the deployment.
 
