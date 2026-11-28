@@ -105,7 +105,8 @@ Add `-PlatformRoot <path>` for a platform checkout elsewhere. It prepares a Sect
 shift and a routing rule, and approves a proposal while no workflow is bound: none starts, NewsRoom reports the setup
 error and a [dry run](src/README.md#dry-run) says why. It then binds the post kind to `newsroom-post` and checks that
 NewsRoom's event starts the [default workflows](src/README.md#default-workflows), and that the real events take the
-post from filing, through its content's sub-workflow and one return by the desk, to publication. The workflow assigns
+post from filing, through its content's sub-workflow and one return by the desk, to publication. A reviewer's approval
+publishes nothing, and neither does a schedule taken back: the desk publishes the post. The workflow assigns
 the reviewer, and again after the reviewer leaves the shift and Content returns the review. A second project is killed
 to check that its sub-workflow is cancelled too. Two more, with no workflow bound, check that Content publishes a due
 post by itself and that killing a project unschedules its post. It plays the writer, the desk and the reviewer

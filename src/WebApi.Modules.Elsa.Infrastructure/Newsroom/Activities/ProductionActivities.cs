@@ -220,9 +220,11 @@ public sealed class DeskReview : NewsroomActivity
         var post = await content.PostAsync(postId, ct)
             ?? throw new PlatformUnavailableException($"Content does not serve post {postId}.");
 
-        // A version whose publication was refused has to change before it counts as approved again.
+        // A version whose publication was refused has to change before it counts as approved again. A post whose
+        // schedule was taken back is not approved for the workflow: the desk publishes it, schedules it or returns it.
         var refused = int.TryParse(Remembered(context, PublishPost.RefusedVersion), out var refusedVersion) ? refusedVersion : -1;
-        if (post.State is "Scheduled" or "Published" || (post.State == "Approved" && post.Version > refused))
+        if (post.State is "Scheduled" or "Published" ||
+            (post.State == "Approved" && !post.ScheduleTakenBack && post.Version > refused))
             return WaitStep.Done(Approved);
 
         var project = await ProjectAsync(context, projectId, ct);
@@ -299,6 +301,11 @@ public sealed class DeskReview : NewsroomActivity
     }
 }
 
+/// <summary>
+/// Publishes or schedules a post that a reviewer approved. It also ends with <see cref="Refused"/>, without asking Content
+/// and without the refusal notification, when the post is no longer the workflow's to publish: the desk took its
+/// schedule back or edited it, or it was returned.
+/// </summary>
 [Activity("SoftSquare.Newsroom", "Newsroom", "Publishes the post, now or at a set time.", DisplayName = "Publish post")]
 [FlowNode(Published, Refused)]
 public sealed class PublishPost : NewsroomActivity
@@ -306,6 +313,12 @@ public sealed class PublishPost : NewsroomActivity
     public const string Published = "Published";
     public const string Refused = "Refused";
     internal const string RefusedVersion = "refusedVersion";
+
+    /// <summary>The notification about a refused publication, which <see cref="Notify"/> holds back after a withdrawal.</summary>
+    internal const string RefusedNotification = "workflow.publish-refused";
+
+    /// <summary>"true" when the last <see cref="Refused"/> was no refusal: the post is simply back with the desk.</summary>
+    internal const string Withdrawn = "publicationWithdrawn";
 
     public Input<string?> ProjectId { get; set; } = default!;
     public Input<string?> PostId { get; set; } = default!;
@@ -333,8 +346,20 @@ public sealed class PublishPost : NewsroomActivity
         if (ProjectStates.Is(project.State, ProjectStates.Killed) ||
             ProjectStates.Is(project.State, ProjectStates.NeedsModeration)) return wait;
 
+        // It went out already and was edited since: publishing the edit is the desk's.
+        if (ProjectStates.Is(project.State, ProjectStates.Published)) return WaitStep.Done(Published);
+
         // Content publishes its own due posts; the activity only waits to see it.
         if (post.State == "Scheduled") return await ScheduledAsync(post.ScheduledFor);
+
+        if (post.State != "Approved" || post.ScheduleTakenBack)
+        {
+            context.Set(Reason, post.State == "Approved"
+                ? "The post's schedule was taken back; the desk decides when it goes out."
+                : $"The post is {post.State}; it is back with the desk.");
+            Remember(context, Withdrawn, "true");
+            return WaitStep.Done(Refused);
+        }
 
         var publishAt = Value(context, PublishAt);
         var later = publishAt > Now(context);
@@ -349,10 +374,11 @@ public sealed class PublishPost : NewsroomActivity
             return WaitStep.Done(Published);
         }
 
-        if (answer.Status == HttpStatusCode.Conflict && (await content.PostAsync(postId, ct))?.Version != post.Version)
-            return wait.Until(Soon(context));
+        // The post changed meanwhile (a return, say), whatever Content answered: look again before calling it a refusal.
+        if ((await content.PostAsync(postId, ct))?.Version != post.Version) return wait.Until(Soon(context));
 
         context.Set(Reason, answer.Reason());
+        Remember(context, Withdrawn, "false");
         Remember(context, RefusedVersion, post.Version.ToString(CultureInfo.InvariantCulture));
         return WaitStep.Done(Refused);
 
@@ -368,6 +394,78 @@ public sealed class PublishPost : NewsroomActivity
             var current = await ProjectAsync(context, projectId, ct);
             if (!ProjectStates.Is(current.State, state))
                 await projects.SetStateAsync(projectId, state, ApprovalOf(context, current), null, ct);
+        }
+    }
+}
+
+/// <summary>
+/// Waits while the desk publishes or schedules an approved post in Content, and follows what happens. It never publishes
+/// or schedules anything itself.
+/// </summary>
+[Activity("SoftSquare.Newsroom", "Newsroom",
+    "Waits until the desk publishes the approved post, now or on a schedule; publishes nothing itself. Ends with BackToDesk when the post is returned or goes back into review.",
+    DisplayName = "Wait for publication")]
+[FlowNode(Published, BackToDesk, Refiled)]
+public sealed class WaitForPublication : NewsroomActivity
+{
+    public const string Published = "Published";
+    public const string BackToDesk = "BackToDesk";
+    public const string Refiled = "Refiled";
+
+    public Input<string?> ProjectId { get; set; } = default!;
+    public Input<string?> PostId { get; set; } = default!;
+
+    /// <summary>
+    /// Ends with <see cref="Refiled"/> when the filing of a post that is not scheduled must be checked again.
+    /// </summary>
+    public Input<bool?> EndOnRefiling { get; set; } = default!;
+
+    protected override async Task<WaitStep> StepAsync(ActivityExecutionContext context, CancellationToken ct)
+    {
+        var projects = context.GetRequiredService<INewsRoomProjects>();
+        var projectId = RequiredProject(context, ProjectId);
+        var postId = RequiredPost(context, PostId);
+        var wait = WaitStep.For(Subjects.Project(projectId), Subjects.Post(postId));
+
+        var post = await context.GetRequiredService<ContentModuleApi>().PostAsync(postId, ct)
+            ?? throw new PlatformUnavailableException($"Content does not serve post {postId}.");
+        var project = await ProjectAsync(context, projectId, ct);
+
+        if (post.State == "Published")
+        {
+            await ReportAsync(ProjectStates.Published);
+            return WaitStep.Done(Published);
+        }
+
+        // It went out already and was edited since.
+        if (ProjectStates.Is(project.State, ProjectStates.Published)) return WaitStep.Done(Published);
+        if (ProjectStates.Is(project.State, ProjectStates.Killed) ||
+            ProjectStates.Is(project.State, ProjectStates.NeedsModeration)) return wait;
+
+        if (post.State == "Scheduled")
+        {
+            await ReportAsync(ProjectStates.Scheduled);
+            return wait.Until(post.ScheduledFor is { } due && due > Now(context) ? due : Soon(context));
+        }
+
+        // Returned, or on its way through review again: the desk review takes it from here.
+        if (post.State is not ("Approved" or "AwaitingDeskReapproval")) return WaitStep.Done(BackToDesk);
+
+        if (Value(context, EndOnRefiling) == true &&
+            Filing.Changed(Remembered(context, Filing.Property), ApprovalOf(context, project), project, post))
+            return WaitStep.Done(Refiled);
+
+        if (ProjectStates.Is(project.State, ProjectStates.InProduction) &&
+            !await projects.SetStateAsync(projectId, ProjectStates.ReadyForDesk, ApprovalOf(context, project), null, ct))
+            return wait.Until(Soon(context));
+
+        return wait;
+
+        // NewsRoom follows Content's own events too, so a refused report is nothing to wait for.
+        async Task ReportAsync(string state)
+        {
+            if (!ProjectStates.Is(project.State, state))
+                await projects.SetStateAsync(projectId, state, ApprovalOf(context, project), null, ct);
         }
     }
 }
@@ -401,6 +499,13 @@ public sealed class Notify : NewsroomActivity
             throw new InvalidOperationException("The activity needs a UserId, ToProjectAuthor or a UnitPath.");
 
         var type = Value(context, NotificationType) is { Length: > 0 } given ? given : DefaultType;
+        if (type == PublishPost.RefusedNotification && Remembered(context, PublishPost.Withdrawn) == "true")
+        {
+            // Nothing was refused. Held back once.
+            Remember(context, PublishPost.Withdrawn, "false");
+            return WaitStep.Done(Sent);
+        }
+
         var payload = JsonSerializer.SerializeToElement(new
         {
             message = Value(context, Message),

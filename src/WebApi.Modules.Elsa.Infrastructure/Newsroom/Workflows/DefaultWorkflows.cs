@@ -31,6 +31,7 @@ public static class DefaultWorkflows
     {
         // Every version that was ever released.
         elsa.AddWorkflow<PostWorkflowV1>();
+        elsa.AddWorkflow<PostWorkflowV2>();
         elsa.AddWorkflow<ContentWorkflowV1>();
     }
 }

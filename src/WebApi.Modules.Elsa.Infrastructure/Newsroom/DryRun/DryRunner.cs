@@ -219,8 +219,13 @@ internal sealed class DryRunner(
                     : "assigns no reviewer (no reviewer role is set)";
                 return new($"Reports the project ReadyForDesk, {reviewer}, and waits for the desk.",
                     run.Post.State == "Returned" ? DeskReview.Returned : DeskReview.Approved,
-                    run.Post.State is not ("Approved" or "Scheduled" or "Published" or "Returned"));
+                    run.Post.State is not ("Approved" or "Scheduled" or "Published" or "Returned") ||
+                    run.Post is { State: "Approved", ScheduleTakenBack: true });
             }
+
+            case WaitForPublication:
+                return new("Waits for the desk to publish or schedule the post in Content; the workflow publishes nothing.",
+                    WaitForPublication.Published, run.Post.State != "Published");
 
             case PublishPost publish:
                 return new(Known(publish.PublishAt) is { } when

@@ -110,9 +110,14 @@ Two workflows ship in code. Every tenant has them under the same definition id.
 
 | Definition id | What it does |
 |---|---|
-| `newsroom-post` | files the post in its Section (a post the Section cannot take waits for the moderator) → produces its contents → desk review (a returned post is produced again) → publishes (a refused publication tells the proposal's author and goes back to the desk) → tells the author |
+| `newsroom-post` **2** (latest) | files the post in its Section (a post the Section cannot take waits for the moderator) → produces its contents → desk review (a returned post is produced again) → **waits until the desk publishes the post** in Content, now or on a schedule → tells the author. It never publishes by itself. |
+| `newsroom-post` 1 | the same up to the desk review, then **publishes the approved post itself** (a refused publication tells the proposal's author and goes back to the desk) → tells the author |
 | `newsroom-content` | gives the content to the unit its kind is routed to → has the people on shift there produce it until it is accepted |
 
+- **Which version of `newsroom-post`.** A NewsRoom binding without a version runs the **latest published** one, so
+  once a deployment has version 2, **new projects under such bindings no longer publish on a reviewer's approval**.
+  Pin the binding to version 1 to keep that. A running instance stays on the version it started with. A start that was
+  delayed (a binding added later, a project approved again that has no instance yet) takes the latest then.
 - **Using them.** A post kind runs `newsroom-post` only where NewsRoom binds it. A content runs the definition bound to
   its content kind (its field key) in the unit that produces it, else `newsroom-content`. That unit is the one NewsRoom's
   routing rules give the kind, else the Section.
@@ -154,6 +159,7 @@ Their type names in a definition are `SoftSquare.Newsroom.<name>`.
 | `Deadline` | `ContentId`, `Stages`, `Due` or `DueIn` | `Met`, `Escalated`, `ProjectEnded` | `EscalatedTo` |
 | `DeskReview` | `ReviewerRoleKey`, `ReviewerDelay`, `EndOnRefiling` | `Approved`, `Returned`, `Refiled` | |
 | `PublishPost` | `PublishAt` | `Published`, `Refused` | `Reason` |
+| `WaitForPublication` | `EndOnRefiling` | `Published`, `BackToDesk`, `Refiled` | |
 | `Notify` | `UserId`, `ToProjectAuthor` or `UnitPath`, `NotificationType`, `Message` | `Done` | |
 
 - **Refiling.** `EnsurePostInUnitCategories` does not stay waiting. To check again when the post's categories or unit
@@ -167,6 +173,26 @@ Their type names in a definition are `SoftSquare.Newsroom.<name>`.
 - **A project that is published**, in the workflow or by hand (NewsRoom follows Content), ends the waits above with
   `ProjectEnded`. In a `Sequence` the workflow then goes on; in a flowchart, leave the outcome unconnected to end there.
 - **Killing** a project cancels its instances. Until the kill's event arrives, their waits do nothing.
+- **Loops.** In a flowchart, a step may lead back to an earlier activity. Elsa 3.9.0 forgets, once an activity has
+  waited, that it was reached by such a step; a later loop then ends the run, "Finished", without an error. The
+  activities above keep that mark themselves. **Elsa's own activities that wait (a delay, an event) do not**: test every
+  loop of an authored definition that passes through one, twice.
+
+### Publishing and the desk
+
+- **A schedule taken back is the desk's.** Content shows an unscheduled post as plain "Approved". `DeskReview` and
+  `PublishPost` read the post's history: once a schedule was taken back, and until a reviewer approves the post again,
+  they neither publish nor schedule it. The desk publishes it, schedules it or returns it in Content. This holds for
+  version 1 too, also for runs that were already waiting, and for a definition whose `PublishPost` has a `PublishAt`.
+- **`PublishPost` only publishes an approved post.** When the post is returned, edited by the desk or unscheduled, it
+  ends with `Refused` without asking Content (`Reason` says why), and the `Notify` of type
+  `workflow.publish-refused` that follows sends nothing. A publication that Content refuses while the post changes is
+  not a refusal either: the activity looks again. In `newsroom-post` 1 the run then waits in the desk review.
+- **Who publishes by hand** (always in version 2) needs `content.publish` on the post and, as Content has DynamicFields
+  check the post as them, `dynamicfields.read`. Content's `WorkflowOwnsAssignment` does not touch publishing or
+  scheduling. Someone who wrote or reviewed the post also needs `content.editor` on its categories.
+  Returning a post the workflow works on takes more: its assigned reviewer (`content.review`), `content.return` or
+  `content.unit.assign`. Give the desk's shift role `content.publish` and `content.return`.
 
 ### Handover in a workflow
 
@@ -180,7 +206,8 @@ Their type names in a definition are `SoftSquare.Newsroom.<name>`.
 
 ### Scheduled publishing
 
-`PublishPost` with `PublishAt` schedules the post and waits. Content publishes it when it is due; Elsa does not ask it to.
+`PublishPost` with `PublishAt` schedules the post and waits; `WaitForPublication` waits for a schedule the desk made.
+Either way Content publishes the post when it is due; Elsa does not ask it to.
 
 When a project is killed, Elsa reads its post and, if it is scheduled (by a workflow or by hand, with or without a
 workflow), takes the schedule back. If Content does not take the call, the kill's event fails and the host delivers it
@@ -253,6 +280,19 @@ Content's E3 deploy notes say how to list them.
 `newsroom-content` stay at version 1, so there is no new class): what changed is what two activities do while they wait,
 and instances resume on the new code. A `PublishPost` waiting on a scheduled post no longer asks Content to publish it.
 A `DeskReview` no longer transfers a review whose shift ended; Content returns it, and the activity assigns it again.
+
+## Upgrading to `newsroom-post` version 2
+
+- **Decide the version first.** A binding of `newsroom-post` without a version moves new projects to version 2 as soon as
+  the module is upgraded: the desk then has to use **Publish now** or **Schedule** in Content, so make sure the desk's
+  people hold the rights above. To keep version 1, set the binding's version to 1 before upgrading. Pinning 2 before
+  the upgrade stops starts until the upgrade (no such definition yet; the event is delivered again).
+- **No grant, setting or database change.** Content must be one that returns the post's history (every version does).
+- **Waiting runs** stay on version 1 and pick up the changes to the desk review and publication.
+- **Runs that the loop fault already touched** are not repaired: a run that was already waiting after a backward step
+  (producing a returned post again, or at the desk after a refused publication) was marked before the upgrade, and a
+  later refiling or return may still end it. Such a project stays open in NewsRoom with a finished workflow; publish it
+  by hand in Content.
 
 ## Engine hosting
 

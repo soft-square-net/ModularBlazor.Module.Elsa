@@ -29,6 +29,9 @@ internal sealed class FakePost
     public string? ReviewerId { get; set; }
     public DateTimeOffset? ScheduledFor { get; set; }
 
+    /// <summary>The actions of the post's history, oldest first.</summary>
+    public List<string> History { get; } = [];
+
     /// <summary>The post's contents: the content's id and whether the post requires it.</summary>
     public List<(Guid ContentId, bool Required)> Attached { get; } = [];
 }
@@ -69,6 +72,12 @@ internal sealed class FakePlatform : HttpMessageHandler
 
     /// <summary>The definition NewsRoom binds to the project's post kind; null when nothing is bound.</summary>
     public string? PostBinding { get; set; } = "project-workflow";
+
+    /// <summary>The version the post binding pins; null for the latest published one.</summary>
+    public int? PostBindingVersion { get; set; }
+
+    /// <summary>What happens to the post while Content handles a publish call, which then fails.</summary>
+    public Action<FakePost>? DuringPublish;
 
     /// <summary>The definitions bound to content kinds.</summary>
     public Dictionary<string, string> ContentBindings { get; } = [];
@@ -131,7 +140,7 @@ internal sealed class FakePlatform : HttpMessageHandler
             case ("GET", ["api", "newsroom", "projects", var id, "workflow"]):
                 if (!Projects.ContainsKey(Guid.Parse(id))) return NotFound();
                 return PostBinding is { } bound
-                    ? Json(new { definitionId = bound, definitionVersion = (int?)null })
+                    ? Json(new { definitionId = bound, definitionVersion = PostBindingVersion })
                     : Conflict("No workflow is bound.");
 
             case ("GET", ["api", "newsroom", "bindings", "resolve"]):
@@ -175,6 +184,7 @@ internal sealed class FakePlatform : HttpMessageHandler
                 {
                     target.State = "Scheduled";
                     target.ScheduledFor = body.GetProperty("publishAt").GetDateTimeOffset();
+                    target.History.Add("scheduled");
                 });
 
             case ("POST", ["api", "content", "posts", var id, "accept"]):
@@ -194,6 +204,7 @@ internal sealed class FakePlatform : HttpMessageHandler
                 {
                     scheduled.State = "Approved";
                     scheduled.ScheduledFor = null;
+                    scheduled.History.Add("unscheduled");
                 });
             }
 
@@ -227,6 +238,17 @@ internal sealed class FakePlatform : HttpMessageHandler
             case ("POST", ["api", "content", "posts", var id, "publish"]):
             {
                 var target = Posts[int.Parse(id)];
+                if (DuringPublish is { } meanwhile)
+                {
+                    DuringPublish = null;
+                    meanwhile(target);
+                    // Not a 409: Content may find something else wrong with the post as it now is.
+                    return new HttpResponseMessage(HttpStatusCode.UnprocessableEntity)
+                    {
+                        Content = new StringContent(JsonSerializer.Serialize(new { detail = "The post is returned." }))
+                    };
+                }
+
                 if (PublishRefusal is { } refusal)
                     return new HttpResponseMessage(HttpStatusCode.UnprocessableEntity)
                     {
@@ -280,6 +302,7 @@ internal sealed class FakePlatform : HttpMessageHandler
     {
         post.Id, post.Version, post.State, post.Categories, post.UnitId, post.ScheduledFor, post.OwnerId,
         post.PostKind,
+        history = post.History.Select(action => new { action }).ToArray(),
         contents = post.Attached.Select(a => new
         {
             a.ContentId, a.Required, fieldKey = Contents[a.ContentId].FieldKey, stage = Contents[a.ContentId].Stage,

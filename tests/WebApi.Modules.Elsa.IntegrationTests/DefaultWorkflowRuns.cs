@@ -48,6 +48,7 @@ public class DefaultWorkflowRuns(PostgresServer server) : IAsyncLifetime
         _platform.UnitCategories[_section] = ["news"];
         _platform.Routes["video"] = _desk;
         _platform.PostBinding = DefaultWorkflows.Post;
+        _platform.PostBindingVersion = 1; // the tests of version 2 say so
         _platform.ShiftUnit = _desk;
         _platform.Rota.Add(new RotaMember(Writer, "writer", false, DateTimeOffset.UtcNow, null));
     }
@@ -103,6 +104,7 @@ public class DefaultWorkflowRuns(PostgresServer server) : IAsyncLifetime
         {
             Post.State = state;
             Post.Version++;
+            Post.History.Add(state.ToLowerInvariant()); // as Content records an approval, a return, a submission
         });
     }
 
@@ -421,6 +423,318 @@ public class DefaultWorkflowRuns(PostgresServer server) : IAsyncLifetime
         Post.State.ShouldBe("Approved");
     }
 
+    // The desk's moves in Content. NewsRoom follows Content's events; the fake does not, so the tests move the project.
+    private async Task DeskSchedulesAsync(Replica replica, TimeSpan from)
+    {
+        _platform.Change(() =>
+        {
+            Post.State = "Scheduled";
+            Post.ScheduledFor = DateTimeOffset.UtcNow + from;
+            Post.History.Add("scheduled");
+            Post.Version++;
+        });
+        await PostChangedAsync(replica);
+    }
+
+    private async Task DeskUnschedulesAsync(Replica replica)
+    {
+        _platform.Change(() =>
+        {
+            Post.State = "Approved";
+            Post.ScheduledFor = null;
+            Post.History.Add("unscheduled");
+            Post.Version++;
+            _project.State = ProjectStates.ReadyForDesk; // as NewsRoom does
+        });
+        await PostChangedAsync(replica);
+    }
+
+    /// <summary>The post stays as the desk left it, and the workflow asks Content for no publication.</summary>
+    private async Task StaysWithTheDeskAsync(Replica replica, string state)
+    {
+        await PostChangedAsync(replica);
+        await Task.Delay(TimeSpan.FromSeconds(3), Ct);
+        await PostChangedAsync(replica);
+        await Task.Delay(TimeSpan.FromSeconds(1), Ct);
+        Post.State.ShouldBe(state);
+        (await InstanceAsync(replica, MainId))!.SubStatus.ShouldBe(WorkflowSubStatus.Suspended);
+        _platform.Count("POST /api/content/posts/42/publish").ShouldBe(0);
+        _platform.Count("POST /api/content/posts/42/schedule").ShouldBe(0);
+    }
+
+    /// <summary>Until the one activity that holds timers and signals is the one named.</summary>
+    private async Task UntilWaitingAtAsync(Replica replica, string activity)
+    {
+        var until = DateTime.UtcNow.AddSeconds(30);
+        while (true)
+        {
+            var state = (await InstanceAsync(replica, MainId))!.WorkflowState;
+            var waiting = state.Bookmarks.Select(b => b.ActivityId).Distinct().ToArray();
+            if (waiting is [var only] && only == activity) return;
+            if (DateTime.UtcNow > until)
+                throw new TimeoutException($"The workflow waits at {string.Join(", ", waiting)}, not at {activity}.");
+            await Task.Delay(100, Ct);
+        }
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task APostTheDeskUnschedulesByHandWaitsForTheDesk(int version)
+    {
+        _platform.PostBindingVersion = version;
+        var replica = await ReplicaAsync();
+        await ToTheDeskAsync(replica);
+        // The reviewer approved, and the desk scheduled it before the workflow looked.
+        _platform.Change(() => { Post.History.Add("approved"); Post.Version++; });
+        await DeskSchedulesAsync(replica, TimeSpan.FromHours(1));
+        await Replica.UntilAsync(() => _project.State == ProjectStates.Scheduled, "the project scheduled");
+
+        await DeskUnschedulesAsync(replica);
+
+        // Version 1 goes back to its desk review; version 2 never left the wait for the desk's publication.
+        var waitsAt = version == 1 ? "desk" : "publication";
+        await UntilWaitingAtAsync(replica, waitsAt);
+        await StaysWithTheDeskAsync(replica, "Approved");
+        _messenger.Sent.ShouldBeEmpty();
+
+        // Scheduled again and taken back again: still the desk's.
+        await DeskSchedulesAsync(replica, TimeSpan.FromHours(2));
+        await Replica.UntilAsync(() => _project.State == ProjectStates.Scheduled, "the project scheduled again");
+        await DeskUnschedulesAsync(replica);
+        await UntilWaitingAtAsync(replica, waitsAt);
+        // A change that keeps it approved is no approval.
+        _platform.Change(() => { Post.History.Add("categories changed"); Post.Version++; });
+        await StaysWithTheDeskAsync(replica, "Approved");
+
+        // Scheduled for soon: Content publishes it when it is due, and the workflow ends.
+        await DeskSchedulesAsync(replica, TimeSpan.FromSeconds(4));
+
+        await EndsAsync(replica, MainId, WorkflowSubStatus.Finished);
+        _project.State.ShouldBe(ProjectStates.Published);
+        _messenger.Sent.Select(m => m.Type).ShouldBe(["workflow.published"]);
+        _platform.Count("POST /api/content/posts/42/publish").ShouldBe(0);
+        _platform.Count("POST /api/content/posts/42/schedule").ShouldBe(0);
+        (await replica.BookmarksAsync(Tenants.A)).ShouldBeEmpty();
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task APostScheduledAndTakenBackWhileNothingLookedIsNotPublished(int version)
+    {
+        _platform.PostBindingVersion = version;
+        var replica = await ReplicaAsync();
+        await ToTheDeskAsync(replica);
+
+        _platform.Change(() =>
+        {
+            Post.State = "Approved";
+            Post.History.AddRange(["approved", "scheduled", "unscheduled"]);
+            Post.Version += 3;
+        });
+
+        await StaysWithTheDeskAsync(replica, "Approved");
+        _messenger.Sent.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task AReviewersApprovalPublishesNothingInVersionTwo()
+    {
+        _platform.PostBindingVersion = null; // a binding without a version runs the latest
+        var replica = await ReplicaAsync();
+        await ToTheDeskAsync(replica);
+        (await InstanceAsync(replica, MainId))!.WorkflowState.DefinitionVersion.ShouldBe(2);
+
+        SetPost("Approved");
+        await PostChangedAsync(replica);
+
+        await UntilWaitingAtAsync(replica, "publication");
+        await StaysWithTheDeskAsync(replica, "Approved");
+        _project.State.ShouldBe(ProjectStates.ReadyForDesk);
+
+        // The desk publishes now.
+        SetPost("Published");
+        await PostChangedAsync(replica);
+
+        await EndsAsync(replica, MainId, WorkflowSubStatus.Finished);
+        _project.State.ShouldBe(ProjectStates.Published);
+        _messenger.Sent.Select(m => m.Type).ShouldBe(["workflow.published"]);
+        _platform.Count("POST /api/content/posts/42/publish").ShouldBe(0);
+        (await replica.BookmarksAsync(Tenants.A)).ShouldBeEmpty();
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)] // returned while scheduled
+    public async Task AReturnFromTheDeskGoesBackToProductionInVersionTwo(bool scheduled)
+    {
+        _platform.PostBindingVersion = 2;
+        var replica = await ReplicaAsync();
+        await ToTheDeskAsync(replica);
+        SetPost("Approved");
+        await PostChangedAsync(replica);
+        await UntilWaitingAtAsync(replica, "publication");
+        if (scheduled)
+        {
+            await DeskSchedulesAsync(replica, TimeSpan.FromHours(1));
+            await Replica.UntilAsync(() => _project.State == ProjectStates.Scheduled, "the project scheduled");
+            _platform.Change(() => _project.State = ProjectStates.InProduction); // as NewsRoom does
+        }
+
+        SetPost("Returned");
+        await PostChangedAsync(replica);
+
+        await UntilWaitingAtAsync(replica, "produce");
+        _project.State.ShouldBe(ProjectStates.InProduction);
+        SetPost("Submitted");
+        await PostChangedAsync(replica);
+        await Replica.UntilAsync(() => _project.State == ProjectStates.ReadyForDesk, "the project at the desk again");
+        SetPost("Approved"); // approved afresh: version 2 still publishes nothing
+        await PostChangedAsync(replica);
+        await UntilWaitingAtAsync(replica, "publication");
+        await StaysWithTheDeskAsync(replica, "Approved");
+        _messenger.Sent.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task AFreshApprovalAfterAnUnscheduleIsPublishedByVersionOneAgain()
+    {
+        var replica = await ReplicaAsync();
+        await ToTheDeskAsync(replica);
+        _platform.Change(() => { Post.History.Add("approved"); Post.Version++; });
+        await DeskSchedulesAsync(replica, TimeSpan.FromHours(1));
+        await Replica.UntilAsync(() => _project.State == ProjectStates.Scheduled, "the project scheduled");
+        await DeskUnschedulesAsync(replica);
+        await UntilWaitingAtAsync(replica, "desk");
+
+        SetPost("Returned");
+        await PostChangedAsync(replica);
+        await Replica.UntilAsync(() => _project.State == ProjectStates.InProduction, "the project back in production");
+        SetPost("Submitted");
+        await PostChangedAsync(replica);
+        await Replica.UntilAsync(() => _project.State == ProjectStates.ReadyForDesk, "the project at the desk again");
+        SetPost("Approved");
+        await PostChangedAsync(replica);
+
+        await EndsAsync(replica, MainId, WorkflowSubStatus.Finished);
+        _platform.Count("POST /api/content/posts/42/publish").ShouldBe(1);
+        _messenger.Sent.Select(m => m.Type).ShouldBe(["workflow.published"]);
+    }
+
+    private async Task SetPostAndWaitAtAsync(Replica replica, string state, string activity)
+    {
+        SetPost(state);
+        await PostChangedAsync(replica);
+        await UntilWaitingAtAsync(replica, activity);
+    }
+
+    /// <summary>
+    /// Loops through activities that wait. Elsa 3.9.0 forgets, once an activity has waited, that a backward connection
+    /// led to it; its flowchart then ends the run instead of scheduling a later activity.
+    /// </summary>
+    [Fact]
+    public async Task EveryLoopOfVersionOneCanBeTakenAgain()
+    {
+        var replica = await ReplicaAsync();
+        await ToTheDeskAsync(replica);
+
+        // A refused publication, then returns from the desk the workflow went back to.
+        _platform.PublishRefusal = "The post's fields are not valid.";
+        SetPost("Approved");
+        await PostChangedAsync(replica);
+        await Replica.UntilAsync(() => _messenger.Sent.Any(m => m.Type == "workflow.publish-refused"), "the refusal told");
+        await UntilWaitingAtAsync(replica, "desk");
+        _platform.PublishRefusal = null;
+
+        for (var round = 0; round < 3; round++)
+        {
+            await SetPostAndWaitAtAsync(replica, "Returned", "produce");
+            await SetPostAndWaitAtAsync(replica, "Submitted", "desk");
+        }
+
+        await RefileAndReturnToTheDeskAsync(replica);
+        await SetPostAndWaitAtAsync(replica, "Returned", "produce");
+        await SetPostAndWaitAtAsync(replica, "Submitted", "desk");
+
+        SetPost("Approved");
+        await PostChangedAsync(replica);
+        await EndsAsync(replica, MainId, WorkflowSubStatus.Finished);
+        Post.State.ShouldBe("Published");
+    }
+
+    [Fact]
+    public async Task EveryLoopOfVersionTwoCanBeTakenAgain()
+    {
+        _platform.PostBindingVersion = 2;
+        var replica = await ReplicaAsync();
+        await ToTheDeskAsync(replica);
+
+        for (var round = 0; round < 2; round++)
+        {
+            await SetPostAndWaitAtAsync(replica, "Approved", "publication");
+            // Returned and submitted again before the workflow looked: the desk review waits after a backward step.
+            _platform.Change(() => Post.History.Add("returned"));
+            await SetPostAndWaitAtAsync(replica, "Submitted", "desk");
+            await SetPostAndWaitAtAsync(replica, "Returned", "produce");
+            await SetPostAndWaitAtAsync(replica, "Submitted", "desk");
+        }
+
+        await RefileAndReturnToTheDeskAsync(replica);
+        await SetPostAndWaitAtAsync(replica, "Approved", "publication");
+        await SetPostAndWaitAtAsync(replica, "Returned", "produce");
+        await SetPostAndWaitAtAsync(replica, "Submitted", "desk");
+        await SetPostAndWaitAtAsync(replica, "Approved", "publication");
+
+        SetPost("Published");
+        await PostChangedAsync(replica);
+        await EndsAsync(replica, MainId, WorkflowSubStatus.Finished);
+        _messenger.Sent.Select(m => m.Type).ShouldBe(["workflow.published"]);
+    }
+
+    // Twice: the moderator is asked about categories the Section does not serve, and the post is filed again.
+    private async Task RefileAndReturnToTheDeskAsync(Replica replica)
+    {
+        for (var round = 0; round < 2; round++)
+        {
+            _platform.Change(() => { Post.Categories = ["sport"]; Post.Version++; });
+            await PostChangedAsync(replica);
+            await UntilWaitingAtAsync(replica, "refile");
+            _project.State.ShouldBe(ProjectStates.NeedsModeration);
+
+            _platform.Change(() =>
+            {
+                Post.Categories = ["news"];
+                Post.Version++;
+                _project.State = ProjectStates.Approved;
+                _project.ApprovalNumber++;
+            });
+            await replica.ApproveAsync(Tenants.A, _project, "newsroom.project-reapproved.v1");
+            await UntilWaitingAtAsync(replica, "desk");
+        }
+    }
+
+    [Fact]
+    public async Task AReturnThatArrivesWhilePublishingRaisesNoRefusal()
+    {
+        var replica = await ReplicaAsync();
+        await ToTheDeskAsync(replica);
+        _platform.DuringPublish = post =>
+        {
+            post.State = "Returned";
+            post.History.Add("returned");
+            post.Version++;
+        };
+
+        SetPost("Approved");
+        await PostChangedAsync(replica);
+
+        await UntilWaitingAtAsync(replica, "produce");
+        _project.State.ShouldBe(ProjectStates.InProduction);
+        _messenger.Sent.ShouldBeEmpty();
+        _platform.Count("POST /api/content/posts/42/publish").ShouldBe(1);
+    }
+
     [Fact]
     public async Task AContentKindsBindingNamesItsSubWorkflow()
     {
@@ -487,8 +801,9 @@ public class DefaultWorkflowRuns(PostgresServer server) : IAsyncLifetime
 
         result.ShouldNotBeNull().Problems.ShouldBeEmpty();
         var main = result.Workflow.ShouldNotBeNull();
-        (main.DefinitionId, main.Version).ShouldBe((DefaultWorkflows.Post, 1));
-        main.Steps.Select(s => s.ActivityId).ShouldBe(["ensure", "produce", "desk", "publish", "announce"]);
+        (main.DefinitionId, main.Version).ShouldBe((DefaultWorkflows.Post, 2)); // no version given: the latest
+        main.Steps.Select(s => s.ActivityId).ShouldBe(["ensure", "produce", "desk", "publication", "announce"]);
+        main.Steps.Single(s => s.ActivityId == "publication").WouldWait.ShouldBeTrue();
         var sub = main.Steps.Single(s => s.ActivityId == "produce").Steps.ShouldNotBeNull();
         (sub.DefinitionId, sub.ContentId).ShouldBe((DefaultWorkflows.Content, _contentId));
         sub.Steps.Select(s => s.ActivityId).ShouldBe(["file", "work"]);
@@ -541,6 +856,7 @@ public class DefaultWorkflowRuns(PostgresServer server) : IAsyncLifetime
     /// </summary>
     [Theory]
     [InlineData(DefaultWorkflows.Post, 1, PostV1)]
+    [InlineData(DefaultWorkflows.Post, 2, PostV2)]
     [InlineData(DefaultWorkflows.Content, 1, ContentV1)]
     public async Task AReleasedVersionKeepsItsGraph(string definitionId, int version, string expected)
     {
@@ -587,6 +903,27 @@ public class DefaultWorkflowRuns(PostgresServer server) : IAsyncLifetime
         publish.Published -> announce
         publish.Refused -> refused
         refused.Done -> desk
+        """;
+
+    private const string PostV2 = """
+        newsroom-post:v2 post start=ensure
+        ensure SoftSquare.Newsroom.EnsurePostInUnitCategories
+        refile SoftSquare.Newsroom.WaitForRefiling
+        produce SoftSquare.Newsroom.ProduceContents
+        desk SoftSquare.Newsroom.DeskReview
+        publication SoftSquare.Newsroom.WaitForPublication
+        announce SoftSquare.Newsroom.Notify
+        ensure.Filed -> produce
+        ensure.NeedsModeration -> refile
+        refile.Refiled -> ensure
+        produce.Produced -> desk
+        produce.Refiled -> ensure
+        desk.Approved -> publication
+        desk.Returned -> produce
+        desk.Refiled -> ensure
+        publication.Published -> announce
+        publication.BackToDesk -> desk
+        publication.Refiled -> ensure
         """;
 
     private const string ContentV1 = """
