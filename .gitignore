@@ -424,3 +424,6 @@ FodyWeavers.xsd
 
 # Official VS Code C# Dev Kit Extension exclusion
 #*.lscache
+
+# The playground's local state (module catalogs, keys, the check's state)
+playground/.data/

@@ -16,7 +16,7 @@ The modules communicate through HTTP and the host's tenant context, not project 
 2. Install `elsa` in the shared module catalog and activate it only in the workflow pool. Install Content and Shifts the same way, activating them in the pools that own their APIs.
 3. Configure the `ConnectionStrings:elsa` secret for the workflow host. The host passes it only to the Elsa module; it is not stored in `modules.json`.
 4. Configure the same confidential OAuth client secret for Identity and the workflow pool. In the Aspire Hybird AppHost, supply the `elsa-client-secret` parameter from Aspire user-secrets or the deployment secret provider.
-5. Grant service subject `elsa-workflows` tenant-wide `content.assign`, `content.transfer`, `content.publish`, and `shifts.manage` (`GET /api/shifts/overdue` requires it). These grants are tenant-scoped and must be provisioned for each tenant; do not add them to the client token as global permissions.
+5. Grant service subject `elsa-workflows` tenant-wide `content.assign`, `content.transfer`, `content.publish`, and `shifts.manage` (`GET /api/shifts/overdue` requires it). The newsroom workflows planned next will also need `content.unit.assign`; the playground grants it already. These grants are tenant-scoped and must be provisioned for each tenant, new ones included (`POST /api/identity/grants` by someone with `access.grants.manage`); do not add them to the client token as global permissions.
 6. Ensure replicas share the module catalog/package storage and configure the Elsa database with durable storage/backups. PostgreSQL is the provider wired by this initial module.
 
 Section settings control the assignment delay (default five minutes) and checkout grace (default fifteen minutes), after which Shifts checks the shift out. Assignment delay begins when the manager accepts the submission. Editing a live creative work retains its published snapshot and cancels a pending schedule pending Desk reapproval.
@@ -32,4 +32,22 @@ For every shift that ended (checked out by a person or by `ShiftClock`), Elsa ca
 - **Replicas** each keep their own cursor and may repeat a handover.
 - **Older Shifts.** When the ended list answers `404`, Elsa uses `GET /api/shifts/overdue` and calls the handover once the shift is past its end plus the checkout grace. That list holds only shifts not checked out yet, so a shift checked out before Elsa's next poll past the grace gets no handover there.
 
-The current coordinator reconciles persisted business deadlines on a configurable polling interval. The Elsa engine, persistence, tenant resolver, and secured Elsa API are hosted by this module. Authorable Elsa workflow definitions for these operations are a follow-up; keep business state transitions in Content/Shifts if that is added.
+The current coordinator reconciles persisted business deadlines on a configurable polling interval. The Elsa engine, persistence, tenant adapters, and secured Elsa API are hosted by this module. Authorable Elsa workflow definitions for these operations are a follow-up; keep business state transitions in Content/Shifts if that is added.
+
+## Engine hosting
+
+- **Own container.** A runtime module's service container has no keyed services, and Elsa registers some. `ElsaEngine` therefore builds Elsa in its own container. The host lends it logging, the environment, data protection and the tenant directory. The engine starts Elsa's hosted services and runs Elsa's request pipeline. Register activities, workflows and their dependencies in `ElsaEngine.AddElsa`, not in `ElsaModule.ConfigureServices`.
+- **Tenants.** A request runs in Elsa as the tenant the platform resolved, and Elsa filters definitions, instances and bookmarks by it. A request without a tenant is refused. **Code outside a request must push the tenant itself** (`ITenantAccessor.PushContext`, in a scope of the engine's container). Without that, Elsa raises no error: it stores and runs the instance under an empty tenant id, where no tenant sees it.
+- **One database for all tenants** (`ConnectionStrings:elsa`, schema `elsa`), PostgreSQL only. Elsa's definition ids are unique across tenants: creating, through the API, a definition with an id another tenant uses answers `500` and changes nothing. Let Elsa generate ids, or make them unique. Workflows registered in code are different: every tenant runs them under the same id, with its own instances.
+- **Timers.** `Elsa.Scheduling` is not referenced, so `Delay`, `Timer` and other scheduled activities are not available yet.
+
+## API permissions
+
+The API is at `/api/elsa/elsa/api/...`, HTTP workflow triggers at `/api/elsa/workflows/...`. An anonymous request gets `401`. The caller needs a platform grant in the request's tenant; behind that check, Elsa's own permission checks all pass.
+
+| Request | Permission |
+|---|---|
+| `/workflows/...`; `/elsa/api/` `workflow-instances`, `events`, `bookmarks`, `resume`, `tasks` (any method) | `workflow.run` |
+| `execute`, `dispatch`, `bulk-dispatch` under `workflow-definitions` or `bulk-actions` (any method) | `workflow.run` |
+| any other `GET` or `HEAD` | `workflow.view` |
+| any other method | `workflow.design` |

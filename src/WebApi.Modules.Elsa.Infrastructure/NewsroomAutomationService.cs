@@ -2,11 +2,10 @@ using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
-using Elsa.Common.Multitenancy;
-using Elsa.Tenants;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using soft.square.net.WebApi.Contracts.Tenancy;
 
 namespace soft.square.net.WebApi.Modules.Elsa.Infrastructure;
 
@@ -17,7 +16,7 @@ namespace soft.square.net.WebApi.Modules.Elsa.Infrastructure;
 /// </summary>
 internal sealed class NewsroomAutomationService(
     NewsroomAutomationClient client,
-    ITenantsProvider tenants,
+    ITenantDirectory tenants,
     IConfiguration settings,
     ILogger<NewsroomAutomationService> logger) : BackgroundService
 {
@@ -28,7 +27,7 @@ internal sealed class NewsroomAutomationService(
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            foreach (var tenant in await tenants.ListAsync(stoppingToken))
+            foreach (var tenant in tenants.All.Where(t => t.IsActive).ToArray())
             {
                 try
                 {
