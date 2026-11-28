@@ -31,6 +31,8 @@ internal sealed class NewsroomEventHandler(ElsaEngine engine) : IIntegrationEven
                 EventData.Guid(envelope.Data, "projectId") is { } killed)
             {
                 await workflows.CancelProjectAsync(killed, token);
+                // After the cancel, so that no workflow schedules the post again.
+                await services.GetRequiredService<KilledProjectSchedule>().UnscheduleAsync(killed, token);
                 return true;
             }
 

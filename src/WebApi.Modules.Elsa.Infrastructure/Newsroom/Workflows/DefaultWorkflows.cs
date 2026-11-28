@@ -73,7 +73,7 @@ internal static class NewsroomSettings
     /// <summary>How long a manager has to assign a content by hand.</summary>
     public const string ManagerDelay = "Elsa:Newsroom:ManagerDelay";
 
-    /// <summary>The shift role that reviews posts; empty when people or the coordinator assign reviews.</summary>
+    /// <summary>The shift role that reviews posts; empty when the workflow assigns no reviewer.</summary>
     public const string ReviewerRole = "Elsa:Newsroom:ReviewerRole";
 
     /// <summary>How long a manager has to accept and assign a review by hand.</summary>

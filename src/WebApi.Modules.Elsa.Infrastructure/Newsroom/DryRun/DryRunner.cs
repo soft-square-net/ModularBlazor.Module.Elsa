@@ -216,7 +216,7 @@ internal sealed class DryRunner(
                 var role = Known(desk.ReviewerRoleKey);
                 var reviewer = role is { Length: > 0 }
                     ? $"after {Known(desk.ReviewerDelay) ?? TimeSpan.Zero} assigns a reviewer of the role {role}"
-                    : "leaves the choice of reviewer to people or the coordinator";
+                    : "assigns no reviewer (no reviewer role is set)";
                 return new($"Reports the project ReadyForDesk, {reviewer}, and waits for the desk.",
                     run.Post.State == "Returned" ? DeskReview.Returned : DeskReview.Approved,
                     run.Post.State is not ("Approved" or "Scheduled" or "Published" or "Returned"));

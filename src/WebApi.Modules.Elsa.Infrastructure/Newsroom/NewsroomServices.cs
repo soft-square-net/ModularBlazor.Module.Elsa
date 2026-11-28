@@ -32,6 +32,7 @@ internal static class NewsroomServices
         services.TryAddScoped<NewsroomWorkflows>();
         services.TryAddScoped<IContentWorkflows>(provider => provider.GetRequiredService<NewsroomWorkflows>());
         services.TryAddScoped<OverdueTimers>();
+        services.TryAddScoped<KilledProjectSchedule>();
         services.TryAddScoped<DryRunner>();
         return services;
     }

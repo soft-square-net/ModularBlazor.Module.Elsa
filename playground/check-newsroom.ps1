@@ -12,9 +12,11 @@
     - no binding: no workflow, a setup error, and a dry run that says why; the binding's event then starts it;
     - newsroom-post and its newsroom-content sub-workflow, from filing to publication, with one return by the desk;
     - a dry run that returns the steps and changes nothing;
-    - a killed project: the workflow and its sub-workflow are cancelled.
+    - the workflow assigns the reviewer, and again after Content returns the review of a reviewer who left the shift;
+    - a killed project: the workflow and its sub-workflow are cancelled;
+    - without a workflow: Content publishes a due post by itself, and killing a scheduled project unschedules its post.
 
-  The people's work (checking in, writing, the desk) is done here, and the modules' events resume the workflows. Safe
+  The people's work (checking in, writing, the desk; the review as editor@modular.local) is done here, and the modules' events resume the workflows. Safe
   to run again on the same data. Exits with 1 when a check fails. DEVELOPMENT ONLY.
 #>
 param([string] $PlatformRoot, [int] $StartTimeoutSeconds = 600)
@@ -74,11 +76,18 @@ function Find-OrCreate-Unit($parentId, [string] $type, [string] $name, $categori
 $sector = Find-OrCreate-Unit $org.rootUnitId 'sector' 'News Sector'
 $department = Find-OrCreate-Unit $sector.id 'department' 'Newsdesk'
 $section = Find-OrCreate-Unit $department.id 'section' 'Local News' $Category
+# The reviewer: the workflow never gives a post to its owner, and the administrator owns NewsRoom's draft posts. Erin
+# is an ordinary member of acme, who can review only while a shift gives her the right.
+$platformSettings = Join-Path $(if ($PlatformRoot) { $PlatformRoot } else { Join-Path $PSScriptRoot '..\..\Platform' }) 'src/WebApi/Identity/WebApi.Identity.Server/appsettings.Development.json'
+$erin = (Get-Content $platformSettings -Raw | ConvertFrom-Json).Identity.Seed.Users | Where-Object Email -eq 'editor@modular.local'
+$reviewerSub = (Get-Claims (Get-UserToken $erin.Email $erin.Password $Tenant)).sub
 # A shift's rota holds members of the unit only.
-$person = @((Org GET "$orgPath/persons").Json) | Where-Object subject -eq $adminSub | Select-Object -First 1
-if (-not $person) { $person = (Org POST "$orgPath/persons" @{ issuer = $issuer; subject = $adminSub; displayName = 'Acme Admin' }).Json }
-if (-not (@((Org GET "$orgPath/memberships").Json) | Where-Object { $_.personId -eq $person.id -and $_.unitId -eq $section.id })) {
-    Org POST "$orgPath/memberships" @{ personId = $person.id; unitId = $section.id; primary = $true; from = [DateTimeOffset]::UtcNow.AddDays(-1).ToString('o') } | Out-Null
+foreach ($who in @(@{ sub = $adminSub; name = 'Acme Admin' }, @{ sub = $reviewerSub; name = 'Erin Editor' })) {
+    $person = @((Org GET "$orgPath/persons").Json) | Where-Object subject -eq $who.sub | Select-Object -First 1
+    if (-not $person) { $person = (Org POST "$orgPath/persons" @{ issuer = $issuer; subject = $who.sub; displayName = $who.name }).Json }
+    if (-not (@((Org GET "$orgPath/memberships").Json) | Where-Object { $_.personId -eq $person.id -and $_.unitId -eq $section.id })) {
+        Org POST "$orgPath/memberships" @{ personId = $person.id; unitId = $section.id; primary = $true; from = [DateTimeOffset]::UtcNow.AddDays(-1).ToString('o') } | Out-Null
+    }
 }
 $seed = @((Org GET "$orgPath/seeds").Json) | Where-Object tenantId -eq $Tenant | Select-Object -First 1
 if (-not $seed) {
@@ -127,7 +136,7 @@ $proposal = (Api POST 'newsroom/proposals' @{ unitId = $section.id; values = @{ 
 $proposal = (Api POST "newsroom/proposals/$($proposal.id)/submit" @{ version = $proposal.version }).Json
 Check ($proposal.state -eq 'Submitted') "proposal $($proposal.id) is $($proposal.state)"
 
-Step 'A running shift with a writer, not yet checked in'
+Step 'A running shift with a writer and a reviewer, not yet checked in'
 # Shifts reads the unit's members as the caller, which takes org.read on the unit and the units above it.
 $held = @((Api GET "identity/grants?userId=$adminSub").Json) | Where-Object { $_.permission -eq 'org.read' -and $_.scope -eq 'tenant' }
 if (-not $held) { Api POST 'identity/grants' @{ userId = $adminSub; permission = 'org.read'; scope = 'tenant' } | Out-Null }
@@ -135,19 +144,25 @@ if (-not $held) { Api POST 'identity/grants' @{ userId = $adminSub; permission =
 $from = [Uri]::EscapeDataString([DateTimeOffset]::UtcNow.AddDays(-2).ToString('o'))
 $to = [Uri]::EscapeDataString([DateTimeOffset]::UtcNow.AddDays(1).ToString('o'))
 foreach ($old in @((Api GET "shifts/shifts?from=$from&to=$to").Json) | Where-Object { $_.unitId -eq $section.id -and $_.running }) {
-    if ($old.rota | Where-Object { $_.userId -eq $adminSub -and $_.checkedInAt -and -not $_.checkedOutAt }) {
+    if ($old.rota | Where-Object { $_.userId -in $adminSub, $reviewerSub -and $_.checkedInAt -and -not $_.checkedOutAt }) {
         Api POST "shifts/shifts/$($old.id)/check-out" | Out-Null
     }
 }
-# AppHost.cs makes this the role that produces contents. Its permissions are held while its shift runs: Content's desk
-# accepts and assigns a post, and the editor reviews it, only with these held in the shift.
+# AppHost.cs makes this the role that produces contents. The reviewers' role is Shifts' own "editor" (content.review).
+# A role's permissions are held while its shift runs.
 $role = @{ key = 'lead-editor'; nameEn = 'Lead editor'; nameAr = 'كبير المحررين'; permissions = @('content.accept', 'content.assign', 'content.review'); isLead = $true }
 $r = Api POST 'shifts/roles' $role -AllowFailure
 if ($r.Status -ge 400 -and $r.Status -ne 409) { throw "Creating the role -> $($r.Status): $($r.Text)" }
-$shift = (Api POST 'shifts/shifts' @{ unitId = $section.id; startsAt = [DateTimeOffset]::UtcNow.ToString('o')
-        endsAt = [DateTimeOffset]::UtcNow.AddHours(2).ToString('o'); rota = @(@{ userId = $adminSub; roleKey = 'lead-editor' }) }).Json
-# Publishing needs the unit's members, which acme's replica may still be pulling.
-Api POST "shifts/shifts/$($shift.id)/publish" | Out-Null
+function New-Shift {
+    $new = (Api POST 'shifts/shifts' @{ unitId = $section.id; startsAt = [DateTimeOffset]::UtcNow.ToString('o')
+            endsAt = [DateTimeOffset]::UtcNow.AddHours(2).ToString('o')
+            rota = @(@{ userId = $adminSub; roleKey = 'lead-editor' }, @{ userId = $reviewerSub; roleKey = 'editor' }) }).Json
+    # Publishing needs the unit's members, which acme's replica may still be pulling.
+    Api POST "shifts/shifts/$($new.id)/publish" | Out-Null
+    return $new
+}
+function Enter-Shift($which, [string] $user) { Api POST "shifts/shifts/$($which.id)/members/$user/check-in" | Out-Null }
+$shift = New-Shift
 
 Step 'NewsRoom: a routing rule for the content kind, and no binding for the post kind yet'
 $ContentKind = 'block.text'   # its one field is all that submitting such a content takes
@@ -232,26 +247,33 @@ Check ((Api GET "content/contents/$($item.id)").Json.stage -eq 'accepted') 'the 
 Expect { (Get-Instances $project | Where-Object definitionId -eq 'newsroom-content').status -eq 'Finished' } 'the sub-workflow finished'
 Expect { (Get-Project $project).state -eq 'ReadyForDesk' } 'NewsRoom has the project ReadyForDesk'
 
-Step 'The desk returns the post once, then approves it; the workflow publishes it'
-function Move-Post([string] $action, [hashtable] $more = @{}) {
+Step 'The post is submitted: the workflow accepts it and assigns the reviewer'
+function Move-Post([string] $action, [hashtable] $more = @{}, [string] $by = $script:token) {
     $post = (Api GET "content/posts/$($project.postId)").Json
-    $r = Api POST "content/posts/$($project.postId)/$action" (@{ version = $post.version } + $more) -AllowFailure
+    $r = Send POST ($Gateway + "api/content/posts/$($project.postId)/$action") (@{ version = $post.version } + $more) -token $by -tenant $Tenant -AllowFailure
     Check ($r.Status -eq 200) "desk: $action ($($r.Status)$(if ($r.Status -ne 200) { ": $($r.Text)" }))"
 }
-function Send-ToReview {
-    Move-Post 'submit'
-    Move-Post 'accept' @{ shiftId = "$($shift.id)" }
-    Move-Post 'assign' @{ shiftId = "$($shift.id)"; assigneeId = $adminSub }
-}
-Send-ToReview
+function Get-PostState { (Api GET "content/posts/$($project.postId)").Json.state }
+function Get-ReviewerToken { Get-UserToken $erin.Email $erin.Password $Tenant }
+Enter-Shift $shift $reviewerSub
+Move-Post 'submit'
+Expect { (Get-PostState) -eq 'InReview' } 'the workflow accepted the post and assigned the reviewer on shift' 90
+
+Step 'The reviewer leaves the shift: Content returns the review, and the workflow assigns it again on the next shift'
+Api POST "shifts/shifts/$($shift.id)/members/$reviewerSub/check-out" | Out-Null
+Expect { (Get-PostState) -eq 'Accepted' } 'Content returned the review to the queue' 120
+$next = New-Shift
+Enter-Shift $next $reviewerSub
+Expect { (Get-PostState) -eq 'InReview' } 'the workflow assigned the review again' 120
+
+Step 'The desk returns the post once, then approves it; the workflow publishes it'
 Move-Post 'return' @{ note = 'Once more.' }
 Expect { (Get-Project $project).state -eq 'InProduction' } 'the returned post is in production again' 45
 Move-Post 'submit'
 Expect { (Get-Project $project).state -eq 'ReadyForDesk' } 'and back at the desk once submitted' 45
-Move-Post 'accept' @{ shiftId = "$($shift.id)" }
-Move-Post 'assign' @{ shiftId = "$($shift.id)"; assigneeId = $adminSub }
-Move-Post 'approve'
-Expect { (Api GET "content/posts/$($project.postId)").Json.state -eq 'Published' } 'elsa-workflows published the post' 45
+Expect { (Get-PostState) -eq 'InReview' } 'with a reviewer again' 90
+Move-Post 'approve' -by (Get-ReviewerToken)
+Expect { (Get-PostState) -eq 'Published' } 'elsa-workflows published the post' 45
 Expect { @(Get-Instances $project | Where-Object status -ne 'Finished').Count -eq 0 } 'both workflows finished' 45
 $finished = Get-Instances $project
 Check (@($finished | Where-Object { $_.subStatus -ne 'Finished' -or $_.incidentCount -ne 0 }).Count -eq 0) 'with no incidents'
@@ -260,6 +282,7 @@ Check (@(Get-Instances $project).Count -eq 2) 'there are still two instances for
 
 Step 'A second project is killed while its content waits: both workflows are cancelled'
 Api POST "shifts/shifts/$($shift.id)/check-out" | Out-Null
+Api POST "shifts/shifts/$($next.id)/check-out" | Out-Null
 $second = (Api POST 'newsroom/proposals' @{ unitId = $section.id; values = @{ title = "Elsa check $([guid]::NewGuid().ToString('N').Substring(0, 8))" }; suggestedCategories = @($Category) }).Json
 $second = (Api POST "newsroom/proposals/$($second.id)/submit" @{ version = $second.version }).Json
 $script:project = Approve-Proposal $second
@@ -270,6 +293,38 @@ Expect { @(Get-Instances $project).Count -eq 2 } 'the added content gets its sub
 $r = Api POST "newsroom/projects/$($project.id)/kill" @{ version = (Get-Project $project).version; reason = 'Elsa check' } -AllowFailure
 Check ($r.Status -lt 300) "killed the project ($($r.Status)$(if ($r.Status -ge 300) { ": $($r.Text)" }))"
 Expect { @(Get-Instances $project | Where-Object subStatus -ne 'Cancelled').Count -eq 0 } 'both workflows are cancelled' 45
+
+Step 'Posts scheduled by hand, for projects without a workflow'
+foreach ($old in @((Api GET "newsroom/bindings?kindType=post&kind=$PostKind").Json) | Where-Object { $_ }) {
+    Api DELETE "newsroom/bindings/$($old.id)?version=$($old.version)" | Out-Null
+}
+$desk = New-Shift
+Enter-Shift $desk $reviewerSub
+# An approved project whose post a person takes to Scheduled: no workflow assigns or publishes anything.
+function New-ScheduledProject([int] $inSeconds) {
+    $proposal = (Api POST 'newsroom/proposals' @{ unitId = $section.id; values = @{ title = "Elsa check $([guid]::NewGuid().ToString('N').Substring(0, 8))" }; suggestedCategories = @($Category) }).Json
+    $proposal = (Api POST "newsroom/proposals/$($proposal.id)/submit" @{ version = $proposal.version }).Json
+    $script:project = Approve-Proposal $proposal
+    $post = (Api GET "content/posts/$($project.postId)").Json
+    Api PUT "content/posts/$($project.postId)/unit" @{ version = $post.version; unitId = $section.id } | Out-Null
+    Move-Post 'submit' | Out-Host
+    Move-Post 'accept' | Out-Host
+    Move-Post 'assign' @{ assigneeId = $reviewerSub } | Out-Host
+    Move-Post 'approve' -by (Get-ReviewerToken) | Out-Host
+    Move-Post 'schedule' @{ publishAt = [DateTimeOffset]::UtcNow.AddSeconds($inSeconds).ToString('o') } | Out-Host
+    Check ((Get-PostState) -eq 'Scheduled') "post $($project.postId) is scheduled in $inSeconds s"
+    return $script:project
+}
+$script:project = New-ScheduledProject 20
+Expect { (Get-PostState) -eq 'Published' } 'Content published the due post by itself' 120
+
+$script:project = New-ScheduledProject 3600
+$r = Api POST "newsroom/projects/$($project.id)/kill" @{ version = (Get-Project $project).version; reason = 'Elsa check' } -AllowFailure
+Check ($r.Status -lt 300) "killed the scheduled project ($($r.Status)$(if ($r.Status -ge 300) { ": $($r.Text)" }))"
+Expect { $p = (Api GET "content/posts/$($project.postId)").Json; $p.state -eq 'Approved' -and -not $p.scheduledFor } 'elsa-workflows unscheduled its post' 45
+Check ((Get-Project $project).state -eq 'Killed') 'the project stays killed'
+Check (@(Get-Instances $project).Count -eq 0) 'and no workflow ran for it'
+Api POST "shifts/shifts/$($desk.id)/check-out" | Out-Null
 
 Write-Host ''
 if ($script:failed -gt 0) { Write-Host "$script:failed check(s) failed." -ForegroundColor Red; exit 1 }

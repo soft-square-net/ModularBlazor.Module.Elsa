@@ -135,6 +135,10 @@ core.WithEnvironment("Platform__DeploymentId", "elsa-playground")
     .WithEnvironment(ShiftsOrg + "ClientScope", "api")
     .WithEnvironment(ShiftsOrg + "ClientSecret", elsaClientSecret)
     .WithEnvironment("Modules__Settings__content__Content__ApiBaseUrl", GatewayUrl)
+    // The workflows assign the work of NewsRoom's posts; the desk's other posts are assigned by hand. A review whose
+    // reviewer lost the right goes back to the queue after a short grace, for check-newsroom.ps1.
+    .WithEnvironment("Modules__Settings__content__Content__Newsroom__WorkflowOwnsAssignment", "true")
+    .WithEnvironment("Modules__Settings__content__Content__Newsroom__ReviewHandoverGrace", "00:00:15")
     .WithEnvironment("Modules__Settings__newsroom__NewsRoom__ApiBaseUrl", GatewayUrl);
 
 // The workflow pool runs Elsa and nothing else (beside the platform's core modules). Only this pool gets the Elsa
@@ -147,11 +151,13 @@ var workflow = AddPool("workflow", WorkflowPort)
     .WithEnvironment("Identity__ElsaClient__ClientSecret", elsaClientSecret)
     .WithEnvironment("Elsa__IdentityAuthority", Issuer)
     .WithEnvironment("Elsa__PlatformApiBaseUrl", GatewayUrl)
-    .WithEnvironment("Modules__Settings__elsa__Elsa__PollInterval", "00:00:10")
     // The role that produces contents (check-newsroom.ps1 puts its writer on shift with it), and a short delay for
     // a manager to assign by hand first.
     .WithEnvironment("Modules__Settings__elsa__Elsa__Newsroom__ContentRole", "lead-editor")
     .WithEnvironment("Modules__Settings__elsa__Elsa__Newsroom__ManagerDelay", "00:00:02")
+    // Goes with Content's WorkflowOwnsAssignment above: the shift role (one of Shifts' own) whose holders review.
+    .WithEnvironment("Modules__Settings__elsa__Elsa__Newsroom__ReviewerRole", "editor")
+    .WithEnvironment("Modules__Settings__elsa__Elsa__Newsroom__ReviewerDelay", "00:00:02")
     // One pool at a time creates the platform's shared tables and the dev tenants.
     .WaitFor(core);
 

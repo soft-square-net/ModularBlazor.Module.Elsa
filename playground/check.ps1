@@ -87,7 +87,7 @@ function Wait-Playground {
     }
     $service = Get-ServiceToken
     foreach ($tenant in $Tenants) {
-        Wait-Until { (Send GET ($Gateway + 'api/content/automation/accepted') -token $service -tenant $tenant -AllowFailure).Status -eq 200 } "the grants of $WorkflowSubject in $tenant" | Out-Null
+        Wait-Until { (Send GET ($Gateway + 'api/shifts/shifts') -token $service -tenant $tenant -AllowFailure).Status -eq 200 } "the grants of $WorkflowSubject in $tenant" | Out-Null
     }
 }
 
@@ -160,7 +160,7 @@ function Test-OtherTenant($state) {
 function Test-ServiceGrants {
     $service = Get-ServiceToken
     foreach ($tenant in $Tenants) {
-        foreach ($path in 'api/content/automation/accepted', 'api/shifts/shifts/ended?since=2026-01-01T00:00:00Z&take=1') {
+        foreach ($path in 'api/shifts/shifts', 'api/organization/local/units') {
             $r = Send GET ($Gateway + $path) -token $service -tenant $tenant -AllowFailure
             Check ($r.Status -eq 200) "$WorkflowSubject may GET /$($path.Split('?')[0]) in $tenant ($($r.Status))"
         }
