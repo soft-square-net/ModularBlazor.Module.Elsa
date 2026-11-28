@@ -11,7 +11,7 @@ $Tenants = 'acme', 'globex'
 
 # The service subject of the workflows (the client id is the token's subject) and what it may do in a tenant, for the
 # whole tenant. The coordinator uses content.assign, content.transfer, content.publish and shifts.manage. The newsroom
-# activities use content.unit.assign (file a post in its Section, and see it), newsroom.workflow (read projects and report
+# activities use content.unit.assign (file a post in its Section, and see it), newsroom.workflow (resolve bindings, routes and workload, read projects and report
 # their state), content.assign, content.publish, dynamicfields.read (Content's publish has DynamicFields check the post as
 # the caller) and org.read (Organization's members of a unit, to find its managers when a deadline passes).
 $WorkflowSubject = 'elsa-workflows'

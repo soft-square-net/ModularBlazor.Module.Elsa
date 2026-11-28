@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
+using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.DryRun;
 using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Platform;
 using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Runtime;
 
@@ -23,13 +24,15 @@ internal static class NewsroomServices
         services.TryAddScoped<ShiftsModuleApi>();
         services.TryAddScoped<OrganizationModuleApi>();
         services.TryAddScoped<INewsRoomProjects, HttpNewsRoomProjects>();
-        services.TryAddScoped<IWorkflowBindings, SettingWorkflowBindings>();
-        services.TryAddScoped<IUnitRouter, InputUnitRouter>();
-        services.TryAddScoped<IShiftWorkload, ContentShiftWorkload>();
+        services.TryAddScoped<IWorkflowBindings, HttpWorkflowBindings>();
+        services.TryAddScoped<IUnitRouter, HttpUnitRouter>();
+        services.TryAddScoped<IShiftWorkload, HttpShiftWorkload>();
         services.TryAddSingleton<ILiveMessenger>(engine => new HostLiveMessenger(
             module, engine.GetRequiredService<ILoggerFactory>().CreateLogger<HostLiveMessenger>()));
         services.TryAddScoped<NewsroomWorkflows>();
+        services.TryAddScoped<IContentWorkflows>(provider => provider.GetRequiredService<NewsroomWorkflows>());
         services.TryAddScoped<OverdueTimers>();
+        services.TryAddScoped<DryRunner>();
         return services;
     }
 }

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
+using Elsa.Features.Services;
 using Elsa.Workflows;
 using Elsa.Workflows.Management;
 using Elsa.Workflows.Management.Entities;
@@ -31,7 +32,10 @@ namespace soft.square.net.WebApi.Modules.Elsa.IntegrationTests;
 /// <summary>One PostgreSQL container for the run; each test takes a database of its own.</summary>
 public sealed class PostgresServer : IAsyncLifetime
 {
-    private readonly PostgreSqlContainer _container = new PostgreSqlBuilder("postgres:17-alpine").Build();
+    private readonly PostgreSqlContainer _container = new PostgreSqlBuilder("postgres:17-alpine")
+        // Each test has a database of its own, and each keeps its engines' pooled connections.
+        .WithCommand("-c", "max_connections=500")
+        .Build();
 
     public async ValueTask InitializeAsync() => await _container.StartAsync();
 
@@ -46,6 +50,15 @@ public sealed class PostgresServer : IAsyncLifetime
     }
 
     public ValueTask DisposeAsync() => _container.DisposeAsync();
+}
+
+/// <summary>
+/// The classes that run engines take turns: Elsa keeps process-wide state while it reads definitions, and a host has
+/// one engine per process (replicas within a test are on purpose).
+/// </summary>
+internal static class EngineTests
+{
+    public const string Collection = "engines";
 }
 
 internal sealed record SentMessage(string Tenant, string Target, string Type, JsonElement Payload);
@@ -110,7 +123,8 @@ internal sealed class Replica : IAsyncDisposable
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
 
     public static async Task<Replica> StartAsync(
-        string database, FakePlatform platform, RecordingMessenger messenger, Dictionary<string, string?>? overrides = null)
+        string database, FakePlatform platform, RecordingMessenger messenger, Dictionary<string, string?>? overrides = null,
+        Action<IModule>? configureElsa = null)
     {
         var settings = new Dictionary<string, string?>
         {
@@ -118,7 +132,6 @@ internal sealed class Replica : IAsyncDisposable
             ["Elsa:IdentityAuthority"] = "http://identity.test",
             ["Elsa:PlatformApiBaseUrl"] = "http://api.test",
             ["Identity:ElsaClient:ClientSecret"] = "test",
-            [SettingWorkflowBindingsKey] = "project-workflow",
             // Long, so that what a test sees happen came from a signal or from the activity's own timer.
             ["Elsa:Newsroom:RecheckInterval"] = "00:10:00",
             ["Elsa:Newsroom:SettleDelay"] = "00:00:01",
@@ -137,7 +150,7 @@ internal sealed class Replica : IAsyncDisposable
         host.AddSingleton<IDataProtectionProvider>(new EphemeralDataProtectionProvider());
         var provider = host.BuildServiceProvider();
 
-        var engine = new ElsaEngine(provider, configuration, configureServices: services =>
+        var engine = new ElsaEngine(provider, configuration, configureElsa, configureServices: services =>
         {
             services.AddHttpClient(PlatformApiClient).ConfigurePrimaryHttpMessageHandler(() => platform);
             services.AddSingleton<ILiveMessenger>(messenger);
@@ -147,7 +160,6 @@ internal sealed class Replica : IAsyncDisposable
         return new Replica(provider, engine);
     }
 
-    private const string SettingWorkflowBindingsKey = "Elsa:Newsroom:ProjectWorkflow";
     private const string PlatformApiClient = "newsroom-platform";
 
     public Task<T> InTenantAsync<T>(string tenant, Func<IServiceProvider, CancellationToken, Task<T>> work) =>
@@ -172,8 +184,9 @@ internal sealed class Replica : IAsyncDisposable
         new NewsroomEventHandler(Engine).HandleAsync(new IntegrationEnvelope(Guid.NewGuid(), type, tenant, subject,
             DateTimeOffset.UtcNow, "test", "test", JsonSerializer.SerializeToElement(data, JsonSerializerOptions.Web)), Ct);
 
-    public Task ApproveAsync(string tenant, FakeProject project) =>
-        DeliverAsync(tenant, "newsroom.project-approved.v1", $"project:{project.Id:D}", new
+    /// <summary>Delivers an approval; project-reapproved and project-binding-available carry the same record.</summary>
+    public Task ApproveAsync(string tenant, FakeProject project, string type = "newsroom.project-approved.v1") =>
+        DeliverAsync(tenant, type, $"project:{project.Id:D}", new
         {
             projectId = project.Id, proposalId = 1, version = 1, approvalNumber = project.ApprovalNumber,
             postId = project.PostId, postPublicId = "p1", postKind = "post.news", sectionId = project.SectionId,

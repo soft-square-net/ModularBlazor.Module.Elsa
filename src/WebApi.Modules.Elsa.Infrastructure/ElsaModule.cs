@@ -29,7 +29,11 @@ public sealed class ElsaModule : IRuntimeModule, IModulePipeline
             ["Elsa:Newsroom:SettleDelay"] = "00:00:02",
             ["Elsa:Newsroom:RetryDelay"] = "00:00:30",
             ["Elsa:Newsroom:TimerSweepInterval"] = "00:01:00",
-            ["Elsa:Newsroom:TimerSweepGrace"] = "00:00:30"
+            ["Elsa:Newsroom:TimerSweepGrace"] = "00:00:30",
+            ["Elsa:Newsroom:ContentRole"] = "writer",
+            ["Elsa:Newsroom:ManagerDelay"] = "00:05:00",
+            ["Elsa:Newsroom:ReviewerRole"] = "", // set only where the workflow owns assignment (Content)
+            ["Elsa:Newsroom:ReviewerDelay"] = "00:05:00"
         },
         Permissions =
         [

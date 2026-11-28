@@ -16,11 +16,15 @@ internal sealed class NewsroomEventHandler(ElsaEngine engine) : IIntegrationEven
         engine.RunInTenantAsync(envelope.TenantId, async (services, token) =>
         {
             var workflows = services.GetRequiredService<NewsroomWorkflows>();
-            if (envelope.Type == NewsroomEventTypes.ProjectApproved)
+            if (envelope.Type is NewsroomEventTypes.ProjectApproved or NewsroomEventTypes.ProjectBindingAvailable)
             {
                 await workflows.StartProjectAsync(ProjectApproved.Read(envelope.Data), token);
                 return true;
             }
+
+            // A project that has no workflow gets one now; one that waits for the moderator hears about it.
+            if (envelope.Type == NewsroomEventTypes.ProjectReapproved)
+                await workflows.StartProjectAsync(ProjectApproved.Read(envelope.Data), token);
 
             if (envelope.Type == NewsroomEventTypes.ProjectStateChanged &&
                 EventData.Text(envelope.Data, "state") is { } state && ProjectStates.Is(state, ProjectStates.Killed) &&

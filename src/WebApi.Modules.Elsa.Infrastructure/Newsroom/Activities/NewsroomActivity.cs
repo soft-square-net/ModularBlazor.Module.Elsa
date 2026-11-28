@@ -7,6 +7,7 @@ using Elsa.Workflows.Models;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Events;
 using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Platform;
 using soft.square.net.WebApi.Modules.Elsa.Infrastructure.Newsroom.Runtime;
 
@@ -44,6 +45,9 @@ public abstract class NewsroomActivity : Activity
     public const string RecheckSetting = "Elsa:Newsroom:RecheckInterval";
     public const string SettleSetting = "Elsa:Newsroom:SettleDelay";
     public const string RetrySetting = "Elsa:Newsroom:RetryDelay";
+
+    /// <summary>The outcome of a wait whose project was published or killed meanwhile: there is nothing left to wait for.</summary>
+    public const string ProjectEnded = "ProjectEnded";
 
     private const string ApprovalProperty = "approval";
 
@@ -150,6 +154,56 @@ public abstract class NewsroomActivity : Activity
     /// <summary>An input's value, or null when the activity was given none.</summary>
     protected static T? Value<T>(ActivityExecutionContext context, Input<T>? input) =>
         input is null ? default : context.Get(input);
+
+    /// <summary>The project the workflow runs for; null in a workflow that was not started for one.</summary>
+    protected static Guid? RunningProject(ActivityExecutionContext context) =>
+        Guid.TryParse(Remembered(context, ProjectInput.ProjectId), out var id) ? id : null;
+
+    /// <summary>
+    /// A wait on the subjects. In a project's workflow it also hears about the project, so that it can end when the
+    /// project does (<see cref="ProjectEndAsync"/>).
+    /// </summary>
+    protected static WaitStep WaitOn(ActivityExecutionContext context, params string[] subjects) =>
+        WaitStep.For(RunningProject(context) is { } project ? [.. subjects, Subjects.Project(project)] : subjects);
+
+    /// <summary>
+    /// How a wait ends with the workflow's project; null while the project goes on. See <see cref="EndOf"/>.
+    /// </summary>
+    protected static async Task<WaitStep?> ProjectEndAsync(ActivityExecutionContext context, CancellationToken ct) =>
+        RunningProject(context) is { } id ? EndOf(await ProjectAsync(context, id, ct)) : null;
+
+    /// <summary>
+    /// A project that was published, in the workflow or outside it (NewsRoom follows Content), leaves nothing to wait
+    /// for: the activity ends with <see cref="ProjectEnded"/>. A killed one is for the kill's event to cancel: until it
+    /// comes the activity does nothing, so that a killed project's workflows always end cancelled, whichever of them
+    /// looks first.
+    /// </summary>
+    protected static WaitStep? EndOf(ProjectSnapshot project)
+    {
+        if (ProjectStates.Is(project.State, ProjectStates.Published)) return WaitStep.Done(ProjectEnded);
+        return ProjectStates.Is(project.State, ProjectStates.Killed) ? WaitStep.For(Subjects.Project(project.Id)) : null;
+    }
+
+    protected static bool IsEnded(ProjectSnapshot project) => EndOf(project) is not null;
+
+    protected static Guid RequiredContent(ActivityExecutionContext context, Input<string?>? input) =>
+        Guid.TryParse(Text(Value(context, input)) ?? Remembered(context, ProjectInput.ContentId), out var id)
+            ? id
+            : throw new InvalidOperationException("The activity needs a ContentId, or a workflow started for a content.");
+
+    /// <summary>
+    /// A moment counted from the first look, and kept, so that a restart does not start the delay again.
+    /// </summary>
+    protected static DateTimeOffset KeptTime(ActivityExecutionContext context, string property, Func<DateTimeOffset> first)
+    {
+        if (context.GetProperty<string>(property) is not { } stored)
+        {
+            stored = first().ToString("O", CultureInfo.InvariantCulture);
+            context.SetProperty(property, stored);
+        }
+
+        return DateTimeOffset.Parse(stored, CultureInfo.InvariantCulture);
+    }
 
     /// <summary>A value the workflow keeps, or the one it was started with.</summary>
     protected static string? Remembered(ActivityExecutionContext context, string name)
